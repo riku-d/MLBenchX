@@ -51,6 +51,12 @@ __all__ = [
     "DATABASE_URL",
     "STORAGE_ROOT",
     "MAX_RUNS_IN_MEMORY",
+    "EXECUTION_TIMEOUT_SECONDS",
+    "EXECUTION_CPU_SECONDS",
+    "EXECUTION_MEMORY_BYTES",
+    "EXECUTION_MAX_OUTPUT_BYTES",
+    "PREVIEW_PAGE_SIZE",
+    "MAX_HISTORY_ENTRIES",
     "STRIP_WIDTH",
     "MAX_COLUMNS_IN_EXPLANATION",
 ]
@@ -220,6 +226,34 @@ SMALL_SAMPLE_PENALTY = _float("SMALL_SAMPLE_PENALTY", 8.0)
 
 #: Blank cells below this share are not worth a line in the issues list.
 MISSING_MENTION_RATE = _float("MISSING_MENTION_RATE", 0.02)
+
+
+# --------------------------------------------------------------------------------------
+# Running user code
+# --------------------------------------------------------------------------------------
+
+#: Wall-clock ceiling for one pipeline run. Generous next to the ~2s a real pipeline
+#: takes on the file sizes this accepts, so only a genuinely stuck script hits it.
+EXECUTION_TIMEOUT_SECONDS = _int("EXECUTION_TIMEOUT_SECONDS", 120)
+
+#: CPU seconds. Lower than the wall clock on purpose: a busy loop should be caught by
+#: the kernel rather than waited out.
+EXECUTION_CPU_SECONDS = _int("EXECUTION_CPU_SECONDS", 90)
+
+#: Address space for the child. Enough for pandas plus a one-hot expansion of a
+#: reasonable dataset, small enough that a runaway allocation dies instead of the
+#: machine swapping.
+EXECUTION_MEMORY_BYTES = _int("EXECUTION_MEMORY_BYTES", 2 * 1024 * 1024 * 1024)
+
+#: Largest file the sandboxed script may write, so a loop appending to the output
+#: cannot fill the disk.
+EXECUTION_MAX_OUTPUT_BYTES = _int("EXECUTION_MAX_OUTPUT_BYTES", 512 * 1024 * 1024)
+
+#: Rows sent to the browser in one dataset preview page.
+PREVIEW_PAGE_SIZE = _int("PREVIEW_PAGE_SIZE", 50)
+
+#: Pipeline states kept for the change-history panel.
+MAX_HISTORY_ENTRIES = _int("MAX_HISTORY_ENTRIES", 50)
 
 
 # --------------------------------------------------------------------------------------
