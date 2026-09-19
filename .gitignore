@@ -5,3 +5,7 @@ __pycache__/
 node_modules/
 frontend/dist/
 .DS_Store
+
+# Local database and stored uploads/pipelines
+backend/mlbenchx.db
+backend/storage/
