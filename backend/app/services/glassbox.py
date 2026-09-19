@@ -6,16 +6,23 @@ dataset ingestion (upstream) and model training (downstream).
 
 Four invariants define the module:
 
-I1 — Split before fit.
-    The train/test split happens before any transformer is fitted. Every learned
-    parameter (imputation medians, scaler means, encoder categories, frequency tables)
-    comes from the training partition alone. See :func:`fit_preprocessing`, where the
-    ordering is explicit and commented.
+I1 — Split before anything is measured.
+    The train/test split is the first thing that happens — before profiling, before
+    screening, before any transformer exists. Every learned parameter (imputation
+    medians, scaler means, encoder categories, frequency tables) and every *decision*
+    (which columns are dropped, which encoder each survivor gets) is a function of the
+    training partition alone. See :func:`fit_preprocessing`, where the ordering is
+    explicit and commented.
+
+    The stricter form matters: profiling the whole frame and only fitting on train is
+    the usual compromise, and it still lets a category that appears exclusively in the
+    held-out rows push a column over the one-hot threshold. Splitting first closes that.
 
 I2 — The log is derived, never hand-written.
     :func:`introspect` reads the *fitted* sklearn objects and reports their learned
     attributes (``SimpleImputer.statistics_``, ``StandardScaler.mean_``/``.scale_``,
-    ``OneHotEncoder.categories_``, ``FrequencyEncoder.frequencies_``). No number in the
+    ``OneHotEncoder.categories_``, ``FrequencyEncoder.frequencies_``,
+    ``TargetEncoder.encodings_``). No number in the
     log is computed a second time alongside the transformation, so the log cannot drift
     out of sync with what actually happened.
 
@@ -32,27 +39,28 @@ I4 — Fully deterministic.
     learned table is emitted in a sorted, stable order. Identical input therefore
     produces a byte-identical log.
 
-Design note — why frequency encoding and not target encoding.
-    High-cardinality categoricals are encoded by :class:`FrequencyEncoder`, which
-    replaces each value by how often it occurs in the training rows. Target (mean)
-    encoding is deliberately *not* implemented: it reads ``y``, so making it
-    leakage-safe requires nested out-of-fold fitting, and a naive implementation is one
-    of the most common sources of silently optimistic AutoML scores. Frequency encoding
-    never touches ``y`` and so cannot leak by construction.
+Design note — two encoders for crowded categoricals, and why frequency is the default.
+    :class:`FrequencyEncoder` replaces each value by how often it occurs in the training
+    rows. It never reads ``y``, so it cannot leak under any circumstances, and that is
+    why it is the default. ``sklearn.preprocessing.TargetEncoder`` is offered as the
+    alternative: it does read ``y``, but it cross-fits internally, so the encoded value
+    a training row receives is computed from folds that exclude that row. A naive mean
+    encoding — the kind that does leak, and one of the most common sources of silently
+    optimistic AutoML scores — is what sklearn's implementation exists to avoid. Both
+    are selectable per run; see :data:`HIGH_CARD_ENCODERS`.
 
 Design note — where dropped columns are recorded.
     Dropped columns are recorded in :attr:`PreprocessingPlan.dropped` (column -> human
     readable reason) rather than as entries in the introspection log. The log describes
     *fitted* transformers, and every entry it emits carries
-    ``fitted_on == "train_fold_only"``; a drop is decided from the schema before any
-    data is read, so putting it in the same list would mean labelling it with a fold it
-    was never fitted on. :func:`format_report` prints the drops ahead of the steps so
+    ``fitted_on == "train_fold_only"``; a drop is decided from the training fold's
+    schema before any transformer exists, so putting it in the same list would mean
+    labelling it with a fitting that never happened. :func:`format_report` prints the drops ahead of the steps so
     the user still sees one continuous narrative.
 
-Out of scope by design: target encoding, datetime feature decomposition, polynomial
-features, PCA, feature selection, class-imbalance resampling, hyperparameter tuning,
-model training, SHAP, persistence. This module returns data structures; storing them is
-the caller's job.
+Out of scope by design: polynomial features, PCA, feature selection, class-imbalance
+resampling, hyperparameter tuning, model training and SHAP. This module returns data
+structures; persisting them is :mod:`app.services.storage`'s job, not this module's.
 """
 
 from __future__ import annotations
@@ -62,6 +70,7 @@ import inspect
 import json
 import math
 import textwrap
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
@@ -72,14 +81,44 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.preprocessing import (
+    MinMaxScaler,
+    OneHotEncoder,
+    OrdinalEncoder,
+    RobustScaler,
+    StandardScaler,
+    TargetEncoder,
+)
 from sklearn.utils.validation import check_is_fitted
+
+from app.config import (
+    DEFAULT_HIGH_CARD_ENCODER,
+    DEFAULT_SCALER,
+    MAX_COLUMNS_IN_EXPLANATION,
+    MAX_MISSING_RATE,
+    ONEHOT_MAX_CARDINALITY,
+    SEED,
+    TARGET_ENCODER_CV,
+    TEST_SIZE,
+    TEXT_MIN_UNIQUE,
+    TEXT_UNIQUE_RATE,
+)
+
+#: A screen that inspects the training fold and reports what should be removed and what
+#: merely deserves a warning. Returns ``(column -> drop reason, flag records)``.
+#: Screens are injected rather than imported so this module keeps no opinion about what
+#: counts as suspicious; see :mod:`app.services.screening` for the implementations.
+Screener = Callable[[pd.DataFrame, pd.Series], tuple[dict[str, str], list[dict[str, Any]]]]
 
 __all__ = [
     "ONEHOT_MAX_CARDINALITY",
     "MAX_MISSING_RATE",
+    "SCALERS",
+    "HIGH_CARD_ENCODERS",
     "ColumnProfile",
+    "Screener",
     "FrequencyEncoder",
+    "DatetimeFeatures",
     "StepPlan",
     "PreprocessingPlan",
     "PreprocessingResult",
@@ -96,34 +135,20 @@ __all__ = [
 
 
 # --------------------------------------------------------------------------------------
-# Tunable thresholds. Named constants rather than literals so the plan, the explanations
-# and the tests all quote the same number.
+# Thresholds all live in app.config. They are re-exported here under their historical
+# names so the plan, the explanations and the tests keep quoting one number.
 # --------------------------------------------------------------------------------------
-
-#: A categorical column with at most this many distinct values is one-hot encoded.
-#: Above it, one-hot would add more columns than the model can usefully absorb, so the
-#: column is frequency encoded instead.
-ONEHOT_MAX_CARDINALITY = 15
-
-#: Columns missing more than this fraction of their values are dropped: whatever is
-#: imputed would be mostly invented data.
-MAX_MISSING_RATE = 0.60
-
-#: A column whose distinct values exceed this share of the rows, *and* which has more
-#: than :data:`TEXT_MIN_UNIQUE` of them, is treated as free text or an identifier.
-TEXT_UNIQUE_RATE = 0.5
-TEXT_MIN_UNIQUE = 50
 
 #: Fixed order of the transformer blocks. ``ColumnTransformer`` emits output columns in
 #: the order its transformers are listed, so the pipeline builder and the feature-map
 #: builder must agree on this tuple.
-GROUP_ORDER: tuple[str, ...] = ("numeric", "binary", "low_card", "high_card")
+GROUP_ORDER: tuple[str, ...] = ("numeric", "binary", "low_card", "high_card", "datetime")
 
-#: Explanations name at most this many columns inline before switching to a summary.
-#: Every value is always present in the machine-readable ``details`` block.
-_MAX_COLUMNS_IN_EXPLANATION = 6
+_MAX_COLUMNS_IN_EXPLANATION = MAX_COLUMNS_IN_EXPLANATION
 
-_STAGE_TO_STEP_NAME = {"impute": "impute", "encode": "encode", "scale": "scale"}
+_STAGE_TO_STEP_NAME = {
+    "impute": "impute", "encode": "encode", "scale": "scale", "derive": "derive",
+}
 
 
 # --------------------------------------------------------------------------------------
@@ -263,6 +288,87 @@ class FrequencyEncoder(TransformerMixin, BaseEstimator):
         return np.asarray([f"{name}_freq" for name in names], dtype=object)
 
 
+class DatetimeFeatures(TransformerMixin, BaseEstimator):
+    """Split a timestamp into the parts of it a model can actually use.
+
+    A datetime is a single enormous integer, and its magnitude means nothing: two orders
+    placed a year apart in the same week of December are far apart as numbers and close
+    together in every way that matters. This breaks each column into ``year``, ``month``,
+    ``day``, ``dayofweek`` and ``hour``, then adds a sine/cosine pair for each of the
+    three cyclical parts.
+
+    The sine/cosine pair is the point. Month 12 and month 1 are adjacent in the calendar
+    but eleven apart as numbers, and no model can discover otherwise from the integer
+    alone. Projecting the month onto a circle puts December next to January by
+    construction, which is what ``sin(2π·m/12)`` and ``cos(2π·m/12)`` together encode —
+    both are needed, because either one alone maps two different months to the same
+    value.
+
+    This transformer learns nothing from the data: the output for a row is a function of
+    that row only. It is still fitted on the training fold, and still reported in the
+    log, because it changes the feature matrix and the user is owed that.
+
+    Attributes set by ``fit``:
+        feature_names_in_: input column names, in order.
+        n_features_in_: number of input columns.
+    """
+
+    #: ``(part, period)`` — period ``None`` means the part is not cyclical, so it is
+    #: emitted as a plain number with no sine/cosine pair.
+    PARTS: tuple[tuple[str, int | None], ...] = (
+        ("year", None),
+        ("month", 12),
+        ("day", 31),
+        ("dayofweek", 7),
+        ("hour", 24),
+    )
+
+    def _as_frame(self, X: Any) -> pd.DataFrame:
+        if isinstance(X, pd.DataFrame):
+            return X
+        array = np.asarray(X, dtype=object)
+        if array.ndim == 1:
+            array = array.reshape(-1, 1)
+        return pd.DataFrame(array, columns=list(self.feature_names_in_))
+
+    def fit(self, X: Any, y: Any = None) -> "DatetimeFeatures":
+        frame = X if isinstance(X, pd.DataFrame) else self._as_frame(X)
+        self.feature_names_in_ = np.asarray(list(frame.columns), dtype=object)
+        self.n_features_in_ = frame.shape[1]
+        return self
+
+    def transform(self, X: Any) -> pd.DataFrame:
+        check_is_fitted(self, "feature_names_in_")
+        frame = self._as_frame(X)
+        columns: dict[str, pd.Series] = {}
+
+        for source in self.feature_names_in_:
+            stamps = pd.to_datetime(frame[source], errors="coerce")
+            for part, period in self.PARTS:
+                values = getattr(stamps.dt, part).astype("float64")
+                # A blank timestamp has no parts. Zero is the neutral value here: it is
+                # what the sine/cosine pair of an unknown angle averages to anyway.
+                columns[f"{source}_{part}"] = values.fillna(0.0)
+                if period is None:
+                    continue
+                angle = 2 * math.pi * values.fillna(0.0) / period
+                columns[f"{source}_{part}_sin"] = np.sin(angle)
+                columns[f"{source}_{part}_cos"] = np.cos(angle)
+
+        return pd.DataFrame(columns, index=frame.index)
+
+    def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        check_is_fitted(self, "feature_names_in_")
+        sources = list(self.feature_names_in_) if input_features is None else list(input_features)
+        names: list[str] = []
+        for source in sources:
+            for part, period in self.PARTS:
+                names.append(f"{source}_{part}")
+                if period is not None:
+                    names.extend([f"{source}_{part}_sin", f"{source}_{part}_cos"])
+        return np.asarray(names, dtype=object)
+
+
 # --------------------------------------------------------------------------------------
 # 3. The plan — decisions, as data
 # --------------------------------------------------------------------------------------
@@ -273,7 +379,7 @@ class StepPlan:
     """One planned transformation: what will run, on which columns, and why."""
 
     step_id: int
-    stage: Literal["drop", "impute", "encode", "scale"]
+    stage: Literal["drop", "impute", "encode", "scale", "derive"]
     columns: list[str]
     transformer: str
     params: dict[str, Any]
@@ -292,11 +398,16 @@ class PreprocessingPlan:
     binary: list[str] = field(default_factory=list)
     low_card: list[str] = field(default_factory=list)
     high_card: list[str] = field(default_factory=list)
+    datetime: list[str] = field(default_factory=list)
+    #: ``"standard"`` | ``"minmax"`` | ``"robust"``.
+    scaler: str = DEFAULT_SCALER
+    #: ``"frequency"`` | ``"target"``.
+    high_card_encoder: str = DEFAULT_HIGH_CARD_ENCODER
 
     @property
     def feature_columns(self) -> list[str]:
         """Surviving input columns, in the order the pipeline consumes them."""
-        return [*self.numeric, *self.binary, *self.low_card, *self.high_card]
+        return [*self.numeric, *self.binary, *self.low_card, *self.high_card, *self.datetime]
 
 
 def _pct(rate: float) -> str:
@@ -311,9 +422,50 @@ _REASON_IMPUTE_MEDIAN = (
     "Numeric columns can have blanks, and the median is used rather than the mean "
     "because a few extreme values cannot drag it around."
 )
-_REASON_SCALE = (
-    "Distance- and gradient-based models compare columns directly, so every number is "
-    "put on a comparable range first."
+#: One entry per offered scaler: the sklearn class, and why someone would pick it.
+SCALERS: dict[str, tuple[str, str]] = {
+    "standard": (
+        "StandardScaler",
+        "Distance- and gradient-based models compare columns directly, so every number "
+        "is put on a comparable range first. Each column is centred on its mean and "
+        "divided by its spread.",
+    ),
+    "minmax": (
+        "MinMaxScaler",
+        "Every number is squeezed into the range 0 to 1, keeping the shape of the "
+        "column exactly as it was. Useful when a model needs bounded inputs, but one "
+        "extreme value compresses everything else against the opposite end.",
+    ),
+    "robust": (
+        "RobustScaler",
+        "Each column is centred on its median and divided by the distance between its "
+        "quartiles, so a handful of extreme values cannot set the scale for the rest. "
+        "The right choice when the column has genuine outliers worth keeping.",
+    ),
+}
+
+#: One entry per offered high-cardinality encoder.
+HIGH_CARD_ENCODERS: dict[str, tuple[str, str]] = {
+    "frequency": (
+        "FrequencyEncoder",
+        f"More than {ONEHOT_MAX_CARDINALITY} distinct values, so one column per value "
+        "would swamp the model. Frequency encoding costs one column and reads only the "
+        "feature itself, never the target, so it cannot leak under any circumstances.",
+    ),
+    "target": (
+        "TargetEncoder",
+        f"More than {ONEHOT_MAX_CARDINALITY} distinct values, so one column per value "
+        "would swamp the model. Each value is replaced by the average outcome for that "
+        "value — computed with cross-fitting, so no row contributes to its own encoded "
+        "value and the training rows do not get an unfairly good number.",
+    ),
+}
+
+_REASON_DATETIME = (
+    "A timestamp is useless to a model as a single number, but the parts of it are not: "
+    "the month, the day of the week and the hour are where seasonal and weekly patterns "
+    "live. Each is split out, and the cyclical ones are written as a sine/cosine pair so "
+    "that December sits next to January rather than eleven months away."
 )
 _REASON_IMPUTE_MODE = (
     "The most common value is the safest stand-in for a missing label, and it is "
@@ -324,21 +476,26 @@ _REASON_LOW_CARD = (
     f"At most {ONEHOT_MAX_CARDINALITY} distinct values, so one column per value is "
     "affordable and avoids implying the categories have an order."
 )
-_REASON_HIGH_CARD = (
-    f"More than {ONEHOT_MAX_CARDINALITY} distinct values, so one column per value "
-    "would swamp the model. Frequency encoding costs one column and reads only the "
-    "feature itself, never the target."
-)
 
-_ENCODERS: dict[str, tuple[str, dict[str, Any], str]] = {
-    "binary": (
-        "OrdinalEncoder",
-        {"handle_unknown": "use_encoded_value", "unknown_value": -1},
-        _REASON_BINARY,
-    ),
-    "low_card": ("OneHotEncoder", {"handle_unknown": "ignore"}, _REASON_LOW_CARD),
-    "high_card": ("FrequencyEncoder", {"unseen_value": 0.0}, _REASON_HIGH_CARD),
-}
+
+def _encoder_spec(group: str, plan: PreprocessingPlan) -> tuple[str, dict[str, Any], str]:
+    """The transformer name, parameters and reason for one categorical group."""
+    if group == "binary":
+        return (
+            "OrdinalEncoder",
+            {"handle_unknown": "use_encoded_value", "unknown_value": -1},
+            _REASON_BINARY,
+        )
+    if group == "low_card":
+        return "OneHotEncoder", {"handle_unknown": "ignore"}, _REASON_LOW_CARD
+
+    name, reason = HIGH_CARD_ENCODERS[plan.high_card_encoder]
+    params: dict[str, Any] = (
+        {"unseen_value": 0.0}
+        if plan.high_card_encoder == "frequency"
+        else {"cv": TARGET_ENCODER_CV, "target_type": "auto", "random_state": SEED}
+    )
+    return name, params, reason
 
 
 def build_plan(
@@ -346,6 +503,8 @@ def build_plan(
     target: str,
     task_type: str,
     excluded: dict[str, str] | None = None,
+    scaler: str = DEFAULT_SCALER,
+    high_card_encoder: str = DEFAULT_HIGH_CARD_ENCODER,
 ) -> PreprocessingPlan:
     """Decide what to do with every column, from the profile alone.
 
@@ -358,17 +517,33 @@ def build_plan(
         target: name of the label column; never becomes a feature.
         task_type: ``"classification"`` or ``"regression"``. Recorded on the plan and
             used downstream to decide stratification.
-        excluded: column -> reason, supplied by the caller (leakage screen, or a column
-            the user deselected in the UI). These reasons take precedence over the
-            generic ones so the more specific message is what the user sees.
+        excluded: column -> reason, supplied by the caller (a screen, or a column the
+            user deselected in the UI). These reasons take precedence over the generic
+            ones so the more specific message is what the user sees.
+        scaler: which scaler numeric columns get — see :data:`SCALERS`.
+        high_card_encoder: which encoder crowded categoricals get — see
+            :data:`HIGH_CARD_ENCODERS`.
 
     Drop precedence, first match wins: target, caller exclusion, mostly-missing,
-    constant, datetime, free text. Mostly-missing is checked before constant so that an
-    all-blank column reports "100% of values are missing" rather than the less
-    actionable "constant".
+    constant, free text. Mostly-missing is checked before constant so that an all-blank
+    column reports "100% of values are missing" rather than the less actionable
+    "constant".
     """
+    if scaler not in SCALERS:
+        raise ValueError(f"scaler must be one of {sorted(SCALERS)}, got {scaler!r}")
+    if high_card_encoder not in HIGH_CARD_ENCODERS:
+        raise ValueError(
+            f"high_card_encoder must be one of {sorted(HIGH_CARD_ENCODERS)}, "
+            f"got {high_card_encoder!r}"
+        )
+
     excluded = dict(excluded or {})
-    plan = PreprocessingPlan(target=target, task_type=task_type)
+    plan = PreprocessingPlan(
+        target=target,
+        task_type=task_type,
+        scaler=scaler,
+        high_card_encoder=high_card_encoder,
+    )
 
     for name, profile in profiles.items():
         if name == target:
@@ -383,14 +558,6 @@ def build_plan(
         if profile.kind == "constant":
             plan.dropped[name] = "constant — a single value carries no information"
             continue
-        if profile.kind == "datetime":
-            # Building calendar features from a timestamp is out of scope for this
-            # version. Dropping it loudly beats letting it vanish unexplained.
-            plan.dropped[name] = (
-                "date/time column — this version does not build calendar features, "
-                "so it cannot be used as-is"
-            )
-            continue
         if profile.kind == "text":
             plan.dropped[name] = (
                 f"free text / identifier — {profile.n_unique} distinct values in "
@@ -398,7 +565,9 @@ def build_plan(
             )
             continue
 
-        if profile.kind == "numeric":
+        if profile.kind == "datetime":
+            plan.datetime.append(name)
+        elif profile.kind == "numeric":
             plan.numeric.append(name)
         elif profile.n_unique == 2:
             plan.binary.append(name)
@@ -419,8 +588,16 @@ def build_plan(
                          _REASON_IMPUTE_MEDIAN)
             )
             step_id += 1
+            scaler_name, scaler_reason = SCALERS[plan.scaler]
             plan.steps.append(
-                StepPlan(step_id, "scale", columns, "StandardScaler", {}, _REASON_SCALE)
+                StepPlan(step_id, "scale", columns, scaler_name, {}, scaler_reason)
+            )
+            step_id += 1
+        elif group == "datetime":
+            plan.steps.append(
+                StepPlan(step_id, "derive", columns, "DatetimeFeatures",
+                         {"parts": [part for part, _ in DatetimeFeatures.PARTS]},
+                         _REASON_DATETIME)
             )
             step_id += 1
         else:
@@ -430,7 +607,7 @@ def build_plan(
                          _REASON_IMPUTE_MODE)
             )
             step_id += 1
-            transformer, params, reason = _ENCODERS[group]
+            transformer, params, reason = _encoder_spec(group, plan)
             plan.steps.append(
                 StepPlan(step_id, "encode", columns, transformer, dict(params), reason)
             )
@@ -444,17 +621,31 @@ def build_plan(
 # --------------------------------------------------------------------------------------
 
 
-def _block(group: str) -> Pipeline:
-    """The two-step Pipeline for one column group.
+_SCALER_CLASSES = {
+    "standard": StandardScaler,
+    "minmax": MinMaxScaler,
+    "robust": RobustScaler,
+}
 
-    Inner step names (``impute``/``encode``/``scale``) are part of the contract:
-    :func:`introspect` and :func:`build_feature_map` look transformers up by them.
+
+def _block(group: str, plan: PreprocessingPlan) -> Pipeline:
+    """The Pipeline for one column group.
+
+    Inner step names (``impute``/``encode``/``scale``/``derive``) are part of the
+    contract: :func:`introspect` and :func:`build_feature_map` look transformers up by
+    them.
     """
     if group == "numeric":
         return Pipeline([
             ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),
-            ("scale", StandardScaler()),
+            ("scale", _SCALER_CLASSES[plan.scaler]()),
         ])
+
+    if group == "datetime":
+        # No imputer: a blank timestamp has no parts, and DatetimeFeatures already
+        # emits zeros for one. Filling it with the most common date first would invent
+        # a specific day that the calendar features would then treat as real.
+        return Pipeline([("derive", DatetimeFeatures())])
 
     imputer = SimpleImputer(strategy="most_frequent", keep_empty_features=True)
     if group == "binary":
@@ -462,7 +653,11 @@ def _block(group: str) -> Pipeline:
     elif group == "low_card":
         encoder = OneHotEncoder(handle_unknown="ignore", sparse_output=False)
     elif group == "high_card":
-        encoder = FrequencyEncoder()
+        encoder = (
+            FrequencyEncoder()
+            if plan.high_card_encoder == "frequency"
+            else TargetEncoder(cv=TARGET_ENCODER_CV, random_state=SEED)
+        )
     else:  # pragma: no cover - guarded by GROUP_ORDER
         raise ValueError(f"unknown column group: {group!r}")
     return Pipeline([("impute", imputer), ("encode", encoder)])
@@ -476,7 +671,7 @@ def build_pipeline(plan: PreprocessingPlan) -> ColumnTransformer:
     loses its column names and the feature map degrades into string-parsing guesswork.
     """
     transformers = [
-        (group, _block(group), list(getattr(plan, group)))
+        (group, _block(group, plan), list(getattr(plan, group)))
         for group in GROUP_ORDER
         if getattr(plan, group)
     ]
@@ -612,21 +807,112 @@ def _impute_entry(step: StepPlan, imputer: Any, train_raw: pd.DataFrame) -> dict
 
 
 def _scale_entry(scaler: Any) -> dict[str, Any]:
-    """Log entry for standardisation, read from ``scaler.mean_`` and ``scaler.scale_``."""
+    """Log entry for a scaling step, read from whichever attributes it fitted.
+
+    All three scalers reduce to the same arithmetic — subtract a centre, divide by a
+    spread — but each learns those two numbers differently and stores them under
+    different names. The centre and spread are recovered here under one pair of keys so
+    the log, the UI card and the exported script describe every scaler the same way.
+    """
     columns = list(scaler.feature_names_in_)
-    means = {c: _jsonable(m) for c, m in zip(columns, scaler.mean_)}
-    scales = {c: _jsonable(s) for c, s in zip(columns, scaler.scale_)}
+    kind = type(scaler).__name__
+
+    if kind == "StandardScaler":
+        centres, spreads = list(scaler.mean_), list(scaler.scale_)
+        summary = (
+            "Rescaled each number to mean 0, spread 1, so a column measured in "
+            "thousands does not outweigh one measured in single digits."
+        )
+        centre_word, spread_word = "mean", "standard deviation"
+    elif kind == "MinMaxScaler":
+        centres = list(scaler.data_min_)
+        spreads = [float(s) if s else 1.0 for s in (scaler.data_max_ - scaler.data_min_)]
+        summary = (
+            "Squeezed each column into the range 0 to 1, so every column contributes "
+            "over the same interval regardless of the units it was measured in."
+        )
+        centre_word, spread_word = "smallest training value", "training range"
+    else:  # RobustScaler
+        centres, spreads = list(scaler.center_), list(scaler.scale_)
+        summary = (
+            "Centred each column on its median and divided by the spread of its middle "
+            "half, so a handful of extreme values cannot set the scale for the rest."
+        )
+        centre_word, spread_word = "median", "interquartile range"
+
+    centre_map = {c: _jsonable(v) for c, v in zip(columns, centres)}
+    spread_map = {c: _jsonable(v) for c, v in zip(columns, spreads)}
     clauses = [
-        f"`{c}` — centred by subtracting {_fmt_number(scaler.mean_[i])}, then divided by "
-        f"{_fmt_number(scaler.scale_[i])}"
+        f"`{c}` — shifted by {_fmt_number(centres[i])}, then divided by "
+        f"{_fmt_number(spreads[i])}"
         for i, c in enumerate(columns)
     ]
     explanation = (
-        "Rescaled each number to mean 0, spread 1, so a column measured in thousands "
-        "does not outweigh one measured in single digits. The centre and spread come "
-        f"from the training rows only: {_join_clauses(clauses)}."
+        f"{summary} The {centre_word} and {spread_word} come from the training rows "
+        f"only: {_join_clauses(clauses)}."
     )
-    return {"details": {"mean": means, "scale": scales}, "explanation": explanation}
+    return {
+        "details": {"scaler": kind, "mean": centre_map, "scale": spread_map},
+        "explanation": explanation,
+    }
+
+
+def _target_entry(encoder: Any) -> dict[str, Any]:
+    """Log entry for target encoding, read from ``encoder.encodings_``."""
+    columns = list(encoder.feature_names_in_)
+    encodings: dict[str, Any] = {}
+    counts: dict[str, int] = {}
+    for column, categories, values in zip(columns, encoder.categories_, encoder.encodings_):
+        table = {str(_jsonable(cat)): _jsonable(val) for cat, val in zip(categories, np.ravel(values))}
+        encodings[column] = table
+        counts[column] = len(table)
+
+    clauses = [f"`{c}` — {counts[c]} distinct values, now 1 column" for c in columns]
+    explanation = (
+        "Too many categories to one-hot, so each value was replaced by the average "
+        f"outcome recorded for it. The overall training average is "
+        f"{_fmt_number(np.ravel(encoder.target_mean_)[0])}, and a value the model has "
+        "not seen falls back to it. The encoded numbers the model trains on are "
+        f"cross-fitted across {encoder.cv} folds, so no row helped compute its own "
+        f"value: {_join_clauses(clauses)}."
+    )
+    return {
+        "details": {
+            "encodings": encodings,
+            "n_categories": counts,
+            "target_mean": _jsonable(np.ravel(encoder.target_mean_)[0]),
+            "cv": int(encoder.cv),
+        },
+        "explanation": explanation,
+    }
+
+
+def _derive_entry(step: StepPlan, transformer: Any) -> dict[str, Any]:
+    """Log entry for datetime decomposition, read from the fitted transformer's outputs."""
+    columns = list(transformer.feature_names_in_)
+    produced = [str(name) for name in transformer.get_feature_names_out()]
+    per_column = {
+        c: [name for name in produced if name.startswith(f"{c}_")] for c in columns
+    }
+    cyclical = [part for part, period in transformer.PARTS if period is not None]
+
+    clauses = [f"`{c}` -> {len(per_column[c])} columns" for c in columns]
+    explanation = (
+        f"Split {len(columns)} date/time column(s) into {len(produced)} numbers a model "
+        f"can use: {', '.join(part for part, _ in transformer.PARTS)}. "
+        f"{', '.join(cyclical).capitalize()} are each also written as a sine/cosine "
+        "pair, which is what puts December next to January instead of eleven months "
+        f"away: {_join_clauses(clauses)}."
+    )
+    return {
+        "details": {
+            "parts": [part for part, _ in transformer.PARTS],
+            "cyclical_parts": cyclical,
+            "columns_created": {c: len(per_column[c]) for c in columns},
+            "feature_names": per_column,
+        },
+        "explanation": explanation,
+    }
 
 
 def _onehot_entry(encoder: Any) -> dict[str, Any]:
@@ -688,6 +974,65 @@ def _frequency_entry(encoder: Any) -> dict[str, Any]:
     }
 
 
+#: Short machine-readable verb for each step, keyed on ``(stage, transformer)``. The
+#: record's ``reason`` is the sentence a person reads; this is what code switches on, so
+#: the two never have to be parsed out of each other.
+_ACTIONS: dict[tuple[str, str], str] = {
+    ("impute", "SimpleImputer"): "impute",
+    ("scale", "StandardScaler"): "scale_standard",
+    ("scale", "MinMaxScaler"): "scale_minmax",
+    ("scale", "RobustScaler"): "scale_robust",
+    ("encode", "OrdinalEncoder"): "encode_label",
+    ("encode", "OneHotEncoder"): "encode_onehot",
+    ("encode", "FrequencyEncoder"): "encode_frequency",
+    ("encode", "TargetEncoder"): "encode_target",
+    ("derive", "DatetimeFeatures"): "derive_datetime",
+}
+
+
+def _before_after(
+    step: StepPlan, fitted: Any, train_raw: pd.DataFrame
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """What the data looked like going into this step, and coming out of it.
+
+    Both sides are measured, not asserted: the input columns come from the training
+    frame as it stood, and the output names come from the fitted transformer itself.
+    Every step therefore states its own effect on the shape of the data, which is the
+    part a reader can check against the table in front of them.
+    """
+    columns = list(step.columns)
+    present = [c for c in columns if c in train_raw.columns]
+    blanks = int(train_raw[present].isna().sum().sum()) if present else 0
+
+    try:
+        out_names = [str(name) for name in fitted.get_feature_names_out(columns)]
+    except Exception:  # noqa: BLE001 - not every transformer names its output
+        out_names = list(columns)
+
+    before: dict[str, Any] = {
+        "n_columns": len(columns),
+        "columns": columns,
+        "missing_values": blanks,
+    }
+    after: dict[str, Any] = {
+        "n_columns": len(out_names),
+        "columns": out_names,
+        "missing_values": 0 if step.stage == "impute" else blanks,
+    }
+
+    if step.stage == "impute":
+        before["dtype"] = "as uploaded"
+        after["dtype"] = "as uploaded, no blanks"
+    elif step.stage in ("encode", "derive"):
+        before["dtype"] = "text or timestamp"
+        after["dtype"] = "numeric"
+    else:
+        before["dtype"] = "numeric, original units"
+        after["dtype"] = "numeric, rescaled"
+
+    return before, after
+
+
 def introspect(
     ct: ColumnTransformer,
     plan: PreprocessingPlan,
@@ -719,23 +1064,32 @@ def introspect(
             body = _impute_entry(step, fitted, train_raw)
         elif step.stage == "scale":
             body = _scale_entry(fitted)
+        elif step.stage == "derive":
+            body = _derive_entry(step, fitted)
         elif step.transformer == "OneHotEncoder":
             body = _onehot_entry(fitted)
         elif step.transformer == "OrdinalEncoder":
             body = _ordinal_entry(fitted)
         elif step.transformer == "FrequencyEncoder":
             body = _frequency_entry(fitted)
-        else:  # pragma: no cover - unreachable while _ENCODERS is the only source
+        elif step.transformer == "TargetEncoder":
+            body = _target_entry(fitted)
+        else:  # pragma: no cover - unreachable while the plan is the only source
             raise ValueError(f"no explanation template for {step.transformer!r}")
 
+        before, after = _before_after(step, fitted, train_raw)
         log.append({
             "step": position,
             "stage": step.stage,
+            "action": _ACTIONS[(step.stage, step.transformer)],
             "columns": list(step.columns),
+            "column": ", ".join(step.columns),
             "transformer": step.transformer,
             "params": _jsonable(step.params),
             "fitted_on": "train_fold_only",
             "reason": step.reason,
+            "before": before,
+            "after": after,
             "details": body["details"],
             "explanation": body["explanation"],
         })
@@ -771,6 +1125,12 @@ def build_feature_map(ct: ColumnTransformer, plan: PreprocessingPlan) -> dict[st
             out_names = list(block.get_feature_names_out(columns))
             for out_name, source in zip(out_names, columns):
                 mapping[str(out_name)] = source
+        elif group == "datetime":
+            # Many output columns per input column, each named "{source}_{part}".
+            derive = block.named_steps["derive"]
+            for source in columns:
+                for out_name in derive.get_feature_names_out([source]):
+                    mapping[str(out_name)] = source
         elif group == "low_card":
             encoder = block.named_steps["encode"]
             out_names = list(encoder.get_feature_names_out(columns))
@@ -811,6 +1171,13 @@ class PreprocessingResult:
     pipeline: ColumnTransformer
     log: list[dict]
     feature_map: dict[str, str]
+    #: Every column the caller or a screener removed, mapped to the reason shown to the
+    #: user. Screener entries are produced from the training fold only, so this is the
+    #: authoritative record of what was set aside and why.
+    excluded: dict[str, str] = field(default_factory=dict)
+    #: Columns a screener flagged as suspicious without removing them — currently the
+    #: target-leakage screen. Flagged columns are still used as features, by design.
+    flags: list[dict[str, Any]] = field(default_factory=list)
 
 
 def _is_classification(task_type: str) -> bool:
@@ -830,24 +1197,37 @@ def fit_preprocessing(
     target: str,
     task_type: str,
     excluded: dict[str, str] | None = None,
-    test_size: float = 0.2,
-    seed: int = 42,
+    test_size: float = TEST_SIZE,
+    seed: int = SEED,
+    screeners: Sequence[Screener] = (),
+    scaler: str = DEFAULT_SCALER,
+    high_card_encoder: str = DEFAULT_HIGH_CARD_ENCODER,
 ) -> PreprocessingResult:
-    """Profile, plan, split, fit, and explain — in that order.
+    """Split, screen, plan, fit, and explain — in that order.
 
-    The ordering below *is* invariant I1. The split happens at step 4 and the single
-    ``fit_transform`` call at step 5 sees ``X_train`` only, so no medians, means,
-    categories or frequency tables can carry information from the test rows.
+    The ordering below *is* invariant I1, and it is stricter than "fit on train only".
+    The split happens at step 2, before anything at all is measured: the column profile
+    that decides which columns are dropped and how each survivor is encoded is computed
+    from ``X_train`` alone, so a value that only ever appears in the test fold cannot
+    change the shape of the pipeline. Every later step inherits that guarantee.
 
     Args:
         df: clean input frame, features and target together.
         target: label column, present in ``df``.
         task_type: ``"classification"`` or ``"regression"``; classification splits are
             stratified on the label.
-        excluded: column -> reason for columns the caller wants removed (leakage screen,
-            user deselection). The reason is surfaced to the user verbatim.
+        excluded: column -> reason for columns the caller wants removed outright, such as
+            one the user deselected in the UI. Caller exclusions are a stated preference
+            rather than a measurement, so they are honoured as given.
         test_size: fraction held out.
         seed: the only source of randomness in the module.
+        screeners: callables run on the *training fold only*, each returning
+            ``(to_drop, flags)``. This is how measurement-based screens — identifier
+            detection, target-leakage correlation — get their verdict without reading a
+            single held-out row. See :mod:`app.services.screening`.
+        scaler: ``"standard"`` | ``"minmax"`` | ``"robust"``; see :data:`SCALERS`.
+        high_card_encoder: ``"frequency"`` | ``"target"``; see
+            :data:`HIGH_CARD_ENCODERS`.
 
     Returns:
         :class:`PreprocessingResult`. ``X_train``/``X_test`` are transformed frames with
@@ -861,37 +1241,56 @@ def fit_preprocessing(
     y = df[target]
     X = df.drop(columns=[target])
 
-    # 2. Decide everything from the schema. Nothing is fitted, nothing is measured on
-    #    values that will end up in the test fold beyond the column profile itself.
-    plan = build_plan(profile_frame(X), target=target, task_type=task_type, excluded=excluded)
-
-    # 3. Remove the columns the plan rejected.
-    X = X.drop(columns=[c for c in plan.dropped if c in X.columns])
-    if X.shape[1] == 0:
-        raise ValueError(
-            "Every column was dropped, so there is nothing to train on. Reasons: "
-            + json.dumps(plan.dropped, indent=2)
-        )
-
-    # 4. Split BEFORE any transformer exists. Stratify so a rare class is represented in
-    #    both folds; fall back when a class is too small to appear on both sides.
+    # 2. Split FIRST — before any column is profiled, screened or fitted. Stratify so a
+    #    rare class is represented in both folds; fall back when a class is too small to
+    #    appear on both sides.
     stratify = None
     if classification:
         counts = y.value_counts(dropna=False)
         if len(counts) > 1 and int(counts.min()) >= 2:
             stratify = y
-    X_train, X_test, y_train, y_test = train_test_split(
+    X_train_raw, X_test_raw, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=seed, shuffle=True, stratify=stratify
     )
+
+    # 3. Screen and profile the TRAINING fold only. Both are measurements, so both
+    #    belong on this side of the split: uniqueness, missing rate and cardinality all
+    #    decide which columns survive and how they are encoded.
+    removals = dict(excluded or {})
+    flags: list[dict[str, Any]] = []
+    for screener in screeners:
+        screened, screen_flags = screener(X_train_raw, y_train)
+        for column, reason in screened.items():
+            removals.setdefault(column, reason)
+        flags.extend(screen_flags)
+
+    plan = build_plan(
+        profile_frame(X_train_raw),
+        target=target,
+        task_type=task_type,
+        excluded=removals,
+        scaler=scaler,
+        high_card_encoder=high_card_encoder,
+    )
+
+    # 4. Remove the columns the plan rejected, from both folds identically.
+    to_drop = [c for c in plan.dropped if c in X_train_raw.columns]
+    X_train_raw = X_train_raw.drop(columns=to_drop)
+    X_test_raw = X_test_raw.drop(columns=to_drop)
+    if X_train_raw.shape[1] == 0:
+        raise ValueError(
+            "Every column was dropped, so there is nothing to train on. Reasons: "
+            + json.dumps(plan.dropped, indent=2)
+        )
 
     # 5. Fit on the training partition only, then apply the frozen pipeline to the test
     #    partition. This is the one and only `.fit` in the module's data path.
     pipeline = build_pipeline(plan)
-    X_train_out = pipeline.fit_transform(X_train)
-    X_test_out = pipeline.transform(X_test)
+    X_train_out = pipeline.fit_transform(X_train_raw, y_train)
+    X_test_out = pipeline.transform(X_test_raw)
 
     # 6. Explain what was learned, and record where each output column came from.
-    log = introspect(pipeline, plan, X_train)
+    log = introspect(pipeline, plan, X_train_raw)
     feature_map = build_feature_map(pipeline, plan)
 
     return PreprocessingResult(
@@ -903,6 +1302,8 @@ def fit_preprocessing(
         pipeline=pipeline,
         log=log,
         feature_map=feature_map,
+        excluded=removals,
+        flags=flags,
     )
 
 
@@ -924,7 +1325,9 @@ from sklearn.compose import ColumnTransformer
 from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import OneHotEncoder, OrdinalEncoder, StandardScaler
+from sklearn.preprocessing import (
+    MinMaxScaler, OneHotEncoder, OrdinalEncoder, RobustScaler, StandardScaler, TargetEncoder,
+)
 {extra_imports}
 CSV_PATH = {csv!r}
 TARGET = {target!r}
@@ -939,7 +1342,8 @@ NUMERIC = {numeric}
 BINARY = {binary}
 LOW_CARD = {low_card}
 HIGH_CARD = {high_card}
-{loader_block}{frequency_encoder}
+DATETIME = {datetime}
+{loader_block}{custom_transformers}
 
 def build_pipeline() -> ColumnTransformer:
     """The same ColumnTransformer the app built for this experiment."""
@@ -964,8 +1368,10 @@ def main() -> None:
 
     pipeline = build_pipeline()
     # --- Fitted on the TRAINING partition only. Everything the transformers learn
-    # --- (medians, means, categories, frequencies) comes from these rows alone.
-    X_train_out = pipeline.fit_transform(X_train)
+    # --- (medians, centres, spreads, categories, frequencies) comes from these rows
+    # --- alone. y_train is passed because TargetEncoder needs it; it cross-fits
+    # --- internally, so no row contributes to its own encoded value.
+    X_train_out = pipeline.fit_transform(X_train, y_train)
     X_test_out = pipeline.transform(X_test)
 
     print("train:", X_train_out.shape, " test:", X_test_out.shape)
@@ -976,48 +1382,73 @@ if __name__ == "__main__":
     main()
 '''
 
-_BLOCK_SOURCE = {
-    "numeric": (
-        '    blocks.append(("numeric", Pipeline([\n'
-        '        ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),\n'
-        '        ("scale", StandardScaler()),\n'
-        '    ]), NUMERIC))\n'
-    ),
-    "binary": (
-        '    blocks.append(("binary", Pipeline([\n'
-        '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
-        '        ("encode", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),\n'
-        '    ]), BINARY))\n'
-    ),
-    "low_card": (
-        '    blocks.append(("low_card", Pipeline([\n'
-        '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
-        '        ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),\n'
-        '    ]), LOW_CARD))\n'
-    ),
-    "high_card": (
-        '    blocks.append(("high_card", Pipeline([\n'
-        '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
-        '        ("encode", FrequencyEncoder()),\n'
-        '    ]), HIGH_CARD))\n'
-    ),
+_SCALER_SOURCE = {
+    "standard": "StandardScaler()",
+    "minmax": "MinMaxScaler()",
+    "robust": "RobustScaler()",
 }
+
+
+def _block_source(plan: PreprocessingPlan) -> str:
+    """Python source for every pipeline block this plan uses, in GROUP_ORDER."""
+    high_card_encoder = (
+        "FrequencyEncoder()"
+        if plan.high_card_encoder == "frequency"
+        else f"TargetEncoder(cv={TARGET_ENCODER_CV}, random_state={SEED})"
+    )
+    sources = {
+        "numeric": (
+            '    blocks.append(("numeric", Pipeline([\n'
+            '        ("impute", SimpleImputer(strategy="median", keep_empty_features=True)),\n'
+            f'        ("scale", {_SCALER_SOURCE[plan.scaler]}),\n'
+            '    ]), NUMERIC))\n'
+        ),
+        "binary": (
+            '    blocks.append(("binary", Pipeline([\n'
+            '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
+            '        ("encode", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),\n'
+            '    ]), BINARY))\n'
+        ),
+        "low_card": (
+            '    blocks.append(("low_card", Pipeline([\n'
+            '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
+            '        ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),\n'
+            '    ]), LOW_CARD))\n'
+        ),
+        "high_card": (
+            '    blocks.append(("high_card", Pipeline([\n'
+            '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
+            f'        ("encode", {high_card_encoder}),\n'
+            '    ]), HIGH_CARD))\n'
+        ),
+        "datetime": (
+            '    blocks.append(("datetime", Pipeline([\n'
+            '        ("derive", DatetimeFeatures()),\n'
+            '    ]), DATETIME))\n'
+        ),
+    }
+    return "".join(sources[group] for group in GROUP_ORDER if getattr(plan, group))
 
 
 def export_script(
     result: PreprocessingResult,
     csv: str,
     exp_id: str,
-    seed: int = 42,
+    seed: int = SEED,
     loader_block: str = "",
     loader_call: str = "pd.read_csv(CSV_PATH)",
 ) -> str:
     """Emit standalone Python that reproduces this preprocessing exactly.
 
     The generated file carries the same column lists, transformer parameters and seed,
-    splits before it fits, and marks the fit-on-train-only line with a comment. When the
-    plan uses :class:`FrequencyEncoder`, its source is embedded via :mod:`inspect` rather
-    than copied into a string, so the export cannot drift from the real implementation.
+    splits before it fits, and marks the fit-on-train-only line with a comment. Any
+    transformer this app defines itself — :class:`FrequencyEncoder`,
+    :class:`DatetimeFeatures` — has its source embedded via :mod:`inspect` rather than
+    copied into a string, so the export cannot drift from the real implementation.
+
+    The script drops its columns before splitting while the app splits first. The two
+    still produce identical folds: ``train_test_split`` chooses rows from the row count,
+    the seed and the test size, none of which the column list affects.
 
     Args:
         result: the outcome of :func:`fit_preprocessing`.
@@ -1037,26 +1468,32 @@ def export_script(
     Returns the source text; writing it to disk is the caller's job.
     """
     plan = result.plan
-    uses_frequency = bool(plan.high_card)
 
-    if uses_frequency:
-        encoder_source = (
-            "\n\n"
-            + textwrap.dedent(inspect.getsource(FrequencyEncoder)).rstrip()
-            + "\n"
+    # Transformers this app defines rather than imports are embedded via `inspect`,
+    # never copied into a string literal, so the export cannot drift from the code that
+    # actually ran.
+    embedded: list[Any] = []
+    if plan.high_card and plan.high_card_encoder == "frequency":
+        embedded.append(FrequencyEncoder)
+    if plan.datetime:
+        embedded.append(DatetimeFeatures)
+
+    if embedded:
+        custom_transformers = "".join(
+            "\n\n" + textwrap.dedent(inspect.getsource(cls)).rstrip() + "\n"
+            for cls in embedded
         )
         extra_imports = (
+            "import math\n"
+            "from typing import Any\n"
             "from sklearn.base import BaseEstimator, TransformerMixin\n"
             "from sklearn.utils.validation import check_is_fitted\n"
-            "from typing import Any\n"
         )
     else:
-        encoder_source = ""
+        custom_transformers = ""
         extra_imports = ""
 
-    blocks = "".join(
-        _BLOCK_SOURCE[group] for group in GROUP_ORDER if getattr(plan, group)
-    )
+    blocks = _block_source(plan)
 
     source = _SCRIPT_TEMPLATE.format(
         exp_id=exp_id,
@@ -1070,7 +1507,8 @@ def export_script(
         binary=_pretty_list(plan.binary),
         low_card=_pretty_list(plan.low_card),
         high_card=_pretty_list(plan.high_card),
-        frequency_encoder=encoder_source,
+        datetime=_pretty_list(plan.datetime),
+        custom_transformers=custom_transformers,
         extra_imports=extra_imports,
         blocks=blocks,
         loader_block=loader_block,

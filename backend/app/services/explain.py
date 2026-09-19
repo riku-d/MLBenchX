@@ -27,13 +27,10 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from app.config import STRIP_WIDTH
 from app.services.glassbox import PreprocessingResult
 
 __all__ = ["build_steps", "build_dropped", "row_noun"]
-
-#: Number of values in the before/after strip. Three is enough to show a change in
-#: context and few enough to read at a glance.
-STRIP_WIDTH = 3
 
 _ROW_NOUNS: tuple[tuple[str, str], ...] = (
     ("student", "students"),
@@ -304,14 +301,30 @@ def _scale_card(
     filled = [fills[lead] if pd.isna(v) else v for v in raw_values]
     centred = [(float(v) - means[lead]) / scales[lead] for v in filled]
 
+    kind = entry["details"].get("scaler", "StandardScaler")
+    what_it_did = {
+        "StandardScaler": (
+            "We shifted and squeezed each column so they all sit around zero and vary "
+            "by a similar amount."
+        ),
+        "MinMaxScaler": (
+            "We squeezed each column into the range 0 to 1, so the smallest value you "
+            "recorded became 0 and the largest became 1."
+        ),
+        "RobustScaler": (
+            "We centred each column on its middle value and scaled it by the spread of "
+            "its middle half, so a few unusually large numbers cannot set the scale for "
+            "everything else."
+        ),
+    }[kind]
+
     return {
         "title": "Put every number on the same footing",
         "explanation": (
             contrast
-            + "We shifted and squeezed each column so they all sit around zero and vary "
-            "by a similar amount. The ordering inside each column is untouched — only "
-            "the units change. The centre and spread were measured on the training rows "
-            "alone."
+            + what_it_did
+            + " The ordering inside each column is untouched — only the units change. "
+            "The centre and spread were measured on the training rows alone."
         ),
         "detail": {c: {"centre": means[c], "spread": scales[c]} for c in columns},
         "strip": _strip(
@@ -450,6 +463,102 @@ def _frequency_card(
     }
 
 
+def _target_encode_card(
+    entry: dict, result: PreprocessingResult, train_raw: pd.DataFrame
+) -> dict[str, Any]:
+    counts = entry["details"]["n_categories"]
+    encodings = entry["details"]["encodings"]
+    average = entry["details"]["target_mean"]
+    columns = entry["columns"]
+    lead = max(columns, key=lambda c: counts[c])
+
+    sentence = (
+        f"{lead} has {counts[lead]} different values — far too many to give each one "
+        f"its own column. Instead each value was replaced by the average outcome "
+        f"recorded against it, next to an overall average of {_fmt(average)}. Because "
+        f"this does read the answer column, it is worked out in "
+        f"{entry['details']['cv']} rotating folds: the number a row is given is "
+        f"computed from other rows only, never from itself. A value never seen before "
+        f"falls back to the overall average."
+    )
+    if len(columns) > 1:
+        others = ", ".join(f"{c} ({counts[c]} values)" for c in columns if c != lead)
+        sentence += f" The same was done for {others}."
+
+    imputer = _fitted(result, "high_card", "impute")
+    fills = dict(zip(imputer.feature_names_in_, imputer.statistics_))
+    labels = _pick_rows(train_raw[lead], prefer_variety=True)
+    raw_values = [train_raw.at[label, lead] for label in labels]
+    filled = [fills[lead] if pd.isna(v) else v for v in raw_values]
+    table = encodings[lead]
+
+    return {
+        "title": "Replaced crowded labels with their average outcome",
+        "explanation": sentence,
+        "detail": {
+            c: {"values": counts[c], "example": dict(list(encodings[c].items())[:5])}
+            for c in columns
+        },
+        "strip": _strip(
+            labels,
+            [_fmt(v) for v in filled],
+            [_fmt(table.get(str(v), average)) for v in filled],
+            [True] * len(labels),
+            lead,
+        ),
+    }
+
+
+def _datetime_card(entry: dict, train_raw: pd.DataFrame) -> dict[str, Any]:
+    columns = entry["columns"]
+    created = entry["details"]["columns_created"]
+    total = sum(created.values())
+    lead = max(columns, key=lambda c: created[c])
+
+    if len(columns) == 1:
+        opening = f"{lead} holds dates, which a model cannot use as they are."
+    else:
+        opening = (
+            f"{_count(len(columns))} of your columns hold dates, which a model cannot "
+            "use as they are."
+        )
+    sentence = (
+        f"{opening} A date is one huge number, and its size means nothing: two events "
+        f"in the same week of December a year apart look far apart, while nothing marks "
+        f"them as both being just before the holidays. We split each date into its "
+        f"parts — year, month, day, day of the week and hour — giving {total} columns "
+        f"the model can actually learn from. The repeating parts are written twice over, "
+        f"as a pair of wave values, which is what puts December next to January instead "
+        f"of eleven months away. Nothing here is learned from your data: every value "
+        f"depends only on the date in that row."
+    )
+
+    labels = _pick_rows(train_raw[lead], prefer_variety=True)
+    raw_values = [train_raw.at[label, lead] for label in labels]
+    stamps = pd.to_datetime(pd.Series(raw_values), errors="coerce")
+
+    def described(stamp: Any) -> str:
+        if pd.isna(stamp):
+            return "—"
+        return f"{stamp.strftime('%b')} · {stamp.strftime('%a')} · {stamp.year}"
+
+    return {
+        "title": "Broke dates into parts a model can use",
+        "explanation": sentence,
+        "detail": {
+            c: {"columns_made": created[c], "parts": entry["details"]["parts"]}
+            for c in columns
+        },
+        "strip": _strip(
+            labels,
+            [_fmt(v) if pd.isna(v) else str(pd.Timestamp(v).date()) for v in raw_values],
+            [described(stamp) for stamp in stamps],
+            [True] * len(labels),
+            lead,
+        ),
+    }
+
+
 def _split_card(result: PreprocessingResult, noun: str) -> dict[str, Any]:
     train_rows = len(result.X_train)
     test_rows = len(result.X_test)
@@ -478,6 +587,7 @@ _STAGE_LABEL = {
     "impute": "impute",
     "scale": "scale",
     "encode": "encode",
+    "derive": "derive",
 }
 
 
@@ -507,6 +617,10 @@ def build_steps(raw: pd.DataFrame, result: PreprocessingResult) -> list[dict[str
             )
         elif stage == "scale":
             card = _scale_card(entry, result, train_raw)
+        elif stage == "derive":
+            card = _datetime_card(entry, train_raw)
+        elif transformer == "TargetEncoder":
+            card = _target_encode_card(entry, result, train_raw)
         elif transformer == "OrdinalEncoder":
             card = _binary_card(entry, train_raw)
         elif transformer == "OneHotEncoder":
@@ -566,12 +680,6 @@ def build_dropped(
             text = (
                 f"{share:.0f}% of {column} is blank. Filling in that much would be "
                 "inventing data rather than using yours. Removed."
-            )
-        elif reason.startswith("date/time"):
-            text = (
-                f"{column} holds dates. Turning dates into something a model can use "
-                "needs choices we would rather you made deliberately, so it is left out "
-                "for now."
             )
         else:
             text = reason if reason.endswith(".") else reason + "."

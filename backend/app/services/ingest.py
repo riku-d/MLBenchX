@@ -26,25 +26,22 @@ import numpy as np
 import pandas as pd
 from charset_normalizer import from_bytes
 
+from app.config import (
+    HEALTH_WEIGHTS,
+    MAX_MISSING_RATE,
+    MIN_ROWS,
+    MISSING_MENTION_RATE,
+    MISSING_TOKENS,
+    SMALL_SAMPLE_PENALTY,
+    SMALL_SAMPLE_ROWS,
+)
+
 __all__ = [
-    "MIN_ROWS",
-    "MISSING_TOKENS",
     "IngestError",
     "IngestResult",
     "read_upload",
     "loader_source",
 ]
-
-#: Below this, a train/test split cannot say anything meaningful.
-MIN_ROWS = 50
-
-#: Strings users type when they mean "no value". Compared case-insensitively after
-#: stripping surrounding whitespace.
-MISSING_TOKENS: frozenset[str] = frozenset({
-    "", "-", "--", "?", "n/a", "na", "n.a.", "nan", "none", "null", "nil",
-    "unknown", "not available", "not applicable", "missing", "#n/a", "#na",
-    "#value!", "#div/0!", "tbd", "no data", ".",
-})
 
 _SPREADSHEET_SUFFIXES = (".xlsx", ".xls", ".xlsm")
 _TEXT_SUFFIXES = (".csv", ".tsv", ".txt")
@@ -84,6 +81,9 @@ class IngestResult:
     missing_cells: int = 0
     duplicate_rows: int = 0
     quality_score: int = 100
+    #: Itemised arithmetic behind ``quality_score`` — one entry per deduction, with the
+    #: amount, the weight applied and the points it cost.
+    quality_breakdown: list[dict] = field(default_factory=list)
     #: Columns that were stored as text and converted to numbers. Recorded so the
     #: exported script can repeat the same conversion.
     numeric_columns: list[str] = field(default_factory=list)
@@ -211,24 +211,48 @@ def _tidy_headers(df: pd.DataFrame) -> int:
 # --------------------------------------------------------------------------------------
 
 
-def _score_quality(df: pd.DataFrame, duplicates: int) -> tuple[int, list[QualityIssue]]:
-    """A 0-100 readable score, with the reasons it is not 100.
+def _score_quality(
+    df: pd.DataFrame, duplicates: int, leakage_flags: int = 0
+) -> tuple[int, list[QualityIssue], list[dict]]:
+    """A 0-100 health score, the reasons it is not 100, and the arithmetic behind it.
 
-    Deliberately simple arithmetic rather than a weighted model: the user is told exactly
-    what cost them points, and a score they can reason about is worth more here than a
-    precise one they cannot.
+    The formula is the weight table in :data:`app.config.HEALTH_WEIGHTS`, applied as::
+
+        score = 100 - Σ min(amount × weight, cap)
+
+    where *amount* is the size of each defect — the percentage of blank cells, the
+    number of empty columns — so a bigger problem costs more, and each cap stops one
+    defect from sinking the score alone. The third return value is that sum, itemised:
+    every deduction with its amount, its weight and the points it cost. A score the user
+    can take apart is worth more than a precise one they have to trust.
     """
     issues: list[QualityIssue] = []
+    breakdown: list[dict] = []
     n_rows, n_columns = df.shape
     total_cells = max(n_rows * n_columns, 1)
 
-    missing_rate = float(df.isna().sum().sum()) / total_cells
+    def deduct(key: str, amount: float, label: str) -> float:
+        """Apply one weighted, capped deduction and record how it was arrived at."""
+        weight, cap = HEALTH_WEIGHTS[key]
+        points = min(amount * weight, cap)
+        if points > 0:
+            breakdown.append({
+                "factor": key,
+                "label": label,
+                "amount": round(amount, 4),
+                "weight": weight,
+                "cap": cap,
+                "points_lost": round(points, 2),
+            })
+        return points
+
     score = 100.0
-    score -= min(missing_rate * 100 * 1.5, 35)
+    missing_rate = float(df.isna().sum().sum()) / total_cells
+    score -= deduct("missing_cells", missing_rate * 100, "blank cells")
 
     if duplicates:
         share = duplicates / max(n_rows, 1)
-        score -= min(share * 100, 15)
+        score -= deduct("duplicate_rows", share * 100, "duplicate rows")
         issues.append(QualityIssue(
             "warning",
             f"{_plural(duplicates, 'row is', 'rows are')} an exact duplicate of another row"
@@ -238,36 +262,49 @@ def _score_quality(df: pd.DataFrame, duplicates: int) -> tuple[int, list[Quality
 
     empty_columns = [c for c in df.columns if df[c].isna().all()]
     if empty_columns:
-        score -= min(len(empty_columns) * 4, 12)
+        score -= deduct("empty_columns", len(empty_columns), "completely empty columns")
         issues.append(QualityIssue(
             "warning",
             f"{_plural(len(empty_columns), 'column is', 'columns are')} completely empty: "
             + ", ".join(empty_columns[:4]),
         ))
 
-    very_sparse = [c for c in df.columns if 0.6 < df[c].isna().mean() < 1.0]
+    very_sparse = [
+        c for c in df.columns if MAX_MISSING_RATE < df[c].isna().mean() < 1.0
+    ]
     if very_sparse:
-        score -= min(len(very_sparse) * 3, 12)
+        score -= deduct("sparse_columns", len(very_sparse), "mostly empty columns")
         issues.append(QualityIssue(
             "warning",
-            f"{_plural(len(very_sparse), 'column is', 'columns are')} more than 60% "
-            "empty: " + ", ".join(very_sparse[:4]),
+            f"{_plural(len(very_sparse), 'column is', 'columns are')} more than "
+            f"{MAX_MISSING_RATE * 100:.0f}% empty: " + ", ".join(very_sparse[:4]),
         ))
 
-    if missing_rate > 0.02:
+    if leakage_flags:
+        score -= deduct("leakage_flags", leakage_flags, "columns that look like the answer")
+
+    if missing_rate > MISSING_MENTION_RATE:
         issues.append(QualityIssue(
             "info",
             f"{missing_rate * 100:.1f}% of all cells are blank — these get filled in later",
         ))
 
-    if n_rows < 200:
-        score -= 8
+    if n_rows < SMALL_SAMPLE_ROWS:
+        score -= SMALL_SAMPLE_PENALTY
+        breakdown.append({
+            "factor": "small_sample",
+            "label": f"fewer than {SMALL_SAMPLE_ROWS} rows",
+            "amount": n_rows,
+            "weight": 0.0,
+            "cap": SMALL_SAMPLE_PENALTY,
+            "points_lost": SMALL_SAMPLE_PENALTY,
+        })
         issues.append(QualityIssue(
             "info",
             f"{n_rows} rows is a small sample, so results will be rough",
         ))
 
-    return max(int(round(score)), 0), issues
+    return max(min(int(round(score)), 100), 0), issues, breakdown
 
 
 # --------------------------------------------------------------------------------------
@@ -380,7 +417,7 @@ def read_upload(raw: bytes, filename: str) -> IngestResult:
 
     duplicates = int(frame.duplicated().sum())
     missing_cells = int(frame.isna().sum().sum())
-    score, issues = _score_quality(frame, duplicates)
+    score, issues, breakdown = _score_quality(frame, duplicates)
 
     if not cleaning:
         cleaning.append("Your file was already tidy — nothing needed repairing")
@@ -397,6 +434,7 @@ def read_upload(raw: bytes, filename: str) -> IngestResult:
         missing_cells=missing_cells,
         duplicate_rows=duplicates,
         quality_score=score,
+        quality_breakdown=breakdown,
         numeric_columns=converted,
     )
 

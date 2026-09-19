@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import io
 import logging
+import re
 import time
+import unicodedata
 import uuid
 from collections import OrderedDict
 from dataclasses import dataclass
@@ -22,33 +24,42 @@ from pathlib import Path
 from typing import Any
 
 import pandas as pd
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, PlainTextResponse
 
-from app.services import explain
+from app.config import (
+    DEFAULT_HIGH_CARD_ENCODER,
+    DEFAULT_SCALER,
+    MAX_RUNS_IN_MEMORY,
+    MAX_UPLOAD_BYTES,
+    MAX_TARGET_CARDINALITY,
+    MIN_ROWS,
+    SEED,
+    TEST_SIZE,
+    UPLOAD_CHUNK_BYTES,
+)
+from app.services import explain, profile as profiling
 from app.services.glassbox import PreprocessingResult, export_script, fit_preprocessing
 from app.services.ingest import (
-    MIN_ROWS,
     IngestError,
     IngestResult,
     loader_source,
     read_upload,
 )
-from app.services.screening import find_identifier_columns
-from app.services.target import describe_task, detect_target, summarise_values
+from app.services.screening import (
+    correlated_pairs,
+    identifier_screen,
+    target_leakage_screen,
+)
+from app.services.target import (
+    class_balance,
+    describe_task,
+    detect_target,
+    summarise_values,
+)
 
 log = logging.getLogger("mlbenchx")
-
-#: Upload ceiling. Generous for a demo, small enough that a mis-drag cannot exhaust RAM.
-MAX_UPLOAD_BYTES = 25 * 1024 * 1024
-
-#: How many runs to keep. Old ones are evicted so a long session cannot grow without
-#: bound; the downloads for the current run always work, which is all this needs.
-MAX_RUNS = 20
-
-#: The only source of randomness in the app.
-SEED = 42
 
 SAMPLE_PATH = Path(__file__).parent / "sample" / "campus_records.csv"
 
@@ -65,6 +76,66 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["*"],
 )
+
+
+@app.middleware("http")
+async def _reject_oversized_bodies(request: Request, call_next):
+    """Refuse an oversized upload from its headers, before a byte of it is parsed.
+
+    Checking the size inside the route is too late: by then Starlette's multipart
+    parser has already spooled the whole body to a temporary file, so a multi-gigabyte
+    POST costs the disk whatever it wants before we get a say. ``Content-Length`` is
+    declared before the body arrives, which is the only point at which refusing is free.
+
+    A chunked request declares no length, so the route's own streaming cap in
+    :func:`_read_capped` remains the backstop rather than the primary defence.
+    """
+    declared = request.headers.get("content-length")
+    if declared and declared.isdigit() and int(declared) > MAX_UPLOAD_BYTES:
+        return JSONResponse(
+            status_code=413,
+            content={"error": _too_large_message()},
+        )
+    return await call_next(request)
+
+
+def _too_large_message() -> str:
+    return (
+        f"That file is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB. "
+        "Try a smaller extract of it."
+    )
+
+
+async def _read_capped(upload: UploadFile) -> bytes:
+    """Read an upload, giving up as soon as it exceeds the cap.
+
+    Nothing larger than the cap is ever held, so the ceiling on memory is the cap
+    itself rather than whatever the client decided to send.
+    """
+    chunks: list[bytes] = []
+    total = 0
+    while chunk := await upload.read(UPLOAD_CHUNK_BYTES):
+        total += len(chunk)
+        if total > MAX_UPLOAD_BYTES:
+            raise UserFacingError(_too_large_message())
+        chunks.append(chunk)
+    return b"".join(chunks)
+
+
+_UNSAFE_IN_FILENAME = re.compile(r"[^A-Za-z0-9._-]+")
+
+
+def _safe_filename(name: str, fallback: str) -> str:
+    """A filename safe to put inside a ``Content-Disposition`` header.
+
+    The name comes from the client, and the header is a single line of ASCII: a quote
+    closes the filename early and a newline splits the header. Rather than escape those,
+    everything outside a known-good set is replaced, which cannot go wrong.
+    """
+    stem = Path(name).stem
+    ascii_only = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode()
+    cleaned = _UNSAFE_IN_FILENAME.sub("_", ascii_only).strip("._-")
+    return cleaned[:80] or fallback
 
 
 @dataclass
@@ -84,7 +155,7 @@ _RUNS: "OrderedDict[str, Run]" = OrderedDict()
 
 def _store(run_id: str, run: Run) -> None:
     _RUNS[run_id] = run
-    while len(_RUNS) > MAX_RUNS:
+    while len(_RUNS) > MAX_RUNS_IN_MEMORY:
         _RUNS.popitem(last=False)
 
 
@@ -144,14 +215,21 @@ def _check_target(frame: pd.DataFrame, column: str) -> None:
             f"More than half of {column} is blank, so there is not enough to learn from. "
             "Pick a different column."
         )
-    if not pd.api.types.is_numeric_dtype(series) and n_unique > 50:
+    if not pd.api.types.is_numeric_dtype(series) and n_unique > MAX_TARGET_CARDINALITY:
         raise UserFacingError(
             f"{column} has {n_unique:,} different values, which looks like a label rather "
             "than an outcome. Pick a column with fewer distinct values."
         )
 
 
-def _analyse(raw_bytes: bytes, filename: str, goal: str, target: str | None) -> dict[str, Any]:
+def _analyse(
+    raw_bytes: bytes,
+    filename: str,
+    goal: str,
+    target: str | None,
+    scaler: str = DEFAULT_SCALER,
+    high_card_encoder: str = DEFAULT_HIGH_CARD_ENCODER,
+) -> dict[str, Any]:
     """Run the whole pipeline and shape the response. Raises UserFacingError on bad input."""
     started = time.perf_counter()
 
@@ -188,18 +266,19 @@ def _analyse(raw_bytes: bytes, filename: str, goal: str, target: str | None) -> 
     task = describe_task(frame[guess.column])
     task_type = "regression" if task == "regression" else "classification"
 
-    # Numeric primary keys profile as ordinary numbers, so they are screened out here and
-    # passed through the same `excluded` channel a leakage screen would use.
-    identifiers = find_identifier_columns(frame, target=guess.column)
-
     try:
         result = fit_preprocessing(
             frame,
             target=guess.column,
             task_type=task_type,
-            excluded=identifiers,
-            test_size=0.2,
+            test_size=TEST_SIZE,
             seed=SEED,
+            # Both screens measure, so both run inside fit_preprocessing on the training
+            # fold. Running them out here on the whole frame would let held-out rows
+            # decide which columns survive.
+            screeners=[identifier_screen, target_leakage_screen],
+            scaler=scaler,
+            high_card_encoder=high_card_encoder,
         )
     except ValueError as exc:
         raise UserFacingError(
@@ -208,7 +287,16 @@ def _analyse(raw_bytes: bytes, filename: str, goal: str, target: str | None) -> 
         ) from exc
 
     steps = explain.build_steps(frame, result)
-    dropped = explain.build_dropped(result, frame, identifiers)
+    dropped = explain.build_dropped(result, frame, result.excluded)
+    balance = class_balance(frame[guess.column]) if task_type == "classification" else None
+    dataset_profile = profiling.build_profile(
+        frame,
+        target=guess.column,
+        excluded=result.excluded,
+        leakage_flags=result.flags,
+        duplicate_rows=ingested.duplicate_rows,
+        balance=balance,
+    )
 
     run_id = uuid.uuid4().hex
     payload = {
@@ -236,7 +324,10 @@ def _analyse(raw_bytes: bytes, filename: str, goal: str, target: str | None) -> 
             "missing_cells": ingested.missing_cells,
             "duplicate_rows": ingested.duplicate_rows,
             "issues": [{"severity": i.severity, "text": i.text} for i in ingested.issues],
+            "breakdown": ingested.quality_breakdown,
         },
+        "profile": dataset_profile,
+        "options": {"scaler": scaler, "high_card_encoder": high_card_encoder},
         "dropped": dropped,
         "steps": steps,
         "result": {
@@ -258,12 +349,7 @@ async def analyse(
     target: str | None = Form(None),
 ) -> dict[str, Any]:
     """Analyse an uploaded spreadsheet and return the full explanation."""
-    raw = await file.read()
-    if len(raw) > MAX_UPLOAD_BYTES:
-        raise UserFacingError(
-            f"That file is larger than {MAX_UPLOAD_BYTES // (1024 * 1024)} MB. "
-            "Try a smaller extract of it."
-        )
+    raw = await _read_capped(file)
     return _analyse(raw, file.filename or "upload.csv", goal, target or None)
 
 
@@ -293,7 +379,7 @@ async def download_data(run_id: str) -> PlainTextResponse:
     frame[run.target] = run.result.y_train
     buffer = io.StringIO()
     frame.to_csv(buffer, index=False)
-    stem = Path(run.filename).stem or "data"
+    stem = _safe_filename(run.filename, "data")
     return PlainTextResponse(
         buffer.getvalue(),
         media_type="text/csv",

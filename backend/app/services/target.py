@@ -12,7 +12,15 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-__all__ = ["TargetGuess", "detect_target", "describe_task", "summarise_values"]
+from app.config import IMBALANCE_RATIO, MAX_TARGET_CLASSES
+
+__all__ = [
+    "TargetGuess",
+    "detect_target",
+    "describe_task",
+    "summarise_values",
+    "class_balance",
+]
 
 #: Words a user is likely to type, mapped to fragments that appear in column names.
 _KEYWORD_MAP: dict[str, tuple[str, ...]] = {
@@ -163,15 +171,71 @@ def detect_target(
 
 
 def describe_task(series: pd.Series) -> str:
-    """Name the prediction task in words the user will recognise."""
+    """Name the prediction task in words the user will recognise.
+
+    Only a *numeric* column can be a regression. Text is never a quantity, however many
+    distinct values it holds, so a categorical target with more classes than
+    ``MAX_TARGET_CLASSES`` is still classification — a hard one, but classification.
+    Calling it regression would be worse than a mislabel: the task type decides whether
+    the split is stratified, so it would quietly disable stratification on exactly the
+    datasets whose rare classes most need it.
+    """
     n_unique = int(series.nunique(dropna=True))
     if n_unique == 2:
         return "binary classification"
-    if pd.api.types.is_numeric_dtype(series) and n_unique > 20:
-        return "regression"
-    if 3 <= n_unique <= 20:
+    if not pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
         return "multiclass classification"
-    return "regression"
+    if _has_fractions(series):
+        # 3.7 and 4.2 are measurements on a scale, not two of several labels.
+        return "regression"
+    return (
+        "multiclass classification" if n_unique <= MAX_TARGET_CLASSES else "regression"
+    )
+
+
+def _has_fractions(series: pd.Series) -> bool:
+    """True when a numeric column holds genuine decimals rather than whole numbers.
+
+    A 1-5 rating stored as ``float`` is still five labels; a price is not.
+    """
+    if not pd.api.types.is_float_dtype(series):
+        return False
+    values = series.dropna()
+    return bool(not values.empty and (values != values.round()).any())
+
+
+def class_balance(series: pd.Series) -> dict | None:
+    """How lopsided a classification target is, or ``None`` if it is not a problem.
+
+    Reported rather than corrected. Resampling or class weights are modelling choices,
+    and this phase of the app does not train a model — but a user who does not know
+    their positives are 4% of the file will read a 96% accuracy as good news.
+    """
+    counts = series.value_counts(dropna=True)
+    if len(counts) < 2:
+        return None
+
+    largest, smallest = int(counts.iloc[0]), int(counts.iloc[-1])
+    ratio = largest / max(smallest, 1)
+    if ratio < IMBALANCE_RATIO:
+        return None
+
+    total = int(counts.sum())
+    return {
+        "ratio": round(ratio, 2),
+        "majority_class": str(counts.index[0]),
+        "majority_share": round(largest / total, 4),
+        "minority_class": str(counts.index[-1]),
+        "minority_count": smallest,
+        "minority_share": round(smallest / total, 4),
+        "reason": (
+            f"{counts.index[0]} accounts for {largest / total * 100:.0f}% of the rows "
+            f"while {counts.index[-1]} has only {smallest:,}. A model that always "
+            f"answered {counts.index[0]} would score {largest / total * 100:.0f}% "
+            "accuracy while being useless, so judge this one on precision and recall "
+            "for the rarer class, not on accuracy."
+        ),
+    }
 
 
 def summarise_values(series: pd.Series, limit: int = 8) -> dict[str, int]:

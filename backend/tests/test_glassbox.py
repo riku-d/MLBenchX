@@ -39,7 +39,7 @@ def frame() -> pd.DataFrame:
     Contents, and what each column is here to prove:
       student_id     unique identifier          -> kind "text", dropped
       campus         single value               -> kind "constant", dropped
-      enrolled_on    timestamps                 -> kind "datetime", dropped
+      enrolled_on    timestamps                 -> kind "datetime", calendar features
       mostly_missing 70% blank                  -> dropped for missingness
       department     5 categories               -> low_card, one-hot
       gender         2 categories               -> binary, ordinal
@@ -128,8 +128,9 @@ def test_2_build_plan_routes_by_cardinality(frame: pd.DataFrame) -> None:
     assert plan.binary == ["gender"]
     assert plan.low_card == ["department"]
     assert plan.high_card == ["city"]
+    assert plan.datetime == ["enrolled_on"]
 
-    assert set(plan.dropped) == {"student_id", "campus", "enrolled_on", "mostly_missing"}
+    assert set(plan.dropped) == {"student_id", "campus", "mostly_missing"}
     assert "constant" in plan.dropped["campus"]
     assert "identifier" in plan.dropped["student_id"]
 
