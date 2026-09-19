@@ -1,6 +1,7 @@
 import { useState } from "react";
 import type { Analysis } from "../api";
 import { downloadUrl } from "../api";
+import { ColumnTable, HealthBreakdown, ProfileWarnings } from "./ColumnTable";
 import { StepCard } from "./StepCard";
 
 function Section({
@@ -183,10 +184,27 @@ export function Results({
               ))}
             </ul>
           )}
+
+          <HealthBreakdown profile={data.profile} />
         </div>
+
+        <ProfileWarnings profile={data.profile} />
       </Section>
 
-      {/* 3 — Columns we set aside */}
+      {/* 3 — Every column, measured */}
+      <Section
+        title="Your columns"
+        aside={
+          <span className="font-mono text-[13px] text-slate">
+            {data.profile.columns.filter((c) => c.used).length} used ·{" "}
+            {data.profile.columns.filter((c) => !c.used && !c.is_target).length} set aside
+          </span>
+        }
+      >
+        <ColumnTable profile={data.profile} />
+      </Section>
+
+      {/* 4 — Columns we set aside, in words */}
       {data.dropped.length > 0 && (
         <Section title="Columns we set aside">
           <div className="rounded-xl border border-slate/15 bg-paper">
@@ -216,7 +234,7 @@ export function Results({
         </Section>
       )}
 
-      {/* 4 — The centrepiece */}
+      {/* 5 — The centrepiece */}
       <Section
         title="What we did to your data"
         aside={
@@ -237,7 +255,7 @@ export function Results({
         </ol>
       </Section>
 
-      {/* 5 — Take it with you */}
+      {/* 6 — Take it with you */}
       <Section title="Take it with you">
         <div className="flex flex-wrap gap-3">
           <a

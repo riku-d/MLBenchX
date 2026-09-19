@@ -10,7 +10,7 @@ export type Strip = {
 
 export type Step = {
   n: number;
-  stage: "split" | "impute" | "encode" | "scale";
+  stage: "split" | "impute" | "encode" | "scale" | "derive";
   title: string;
   columns: string[];
   explanation: string;
@@ -20,8 +20,91 @@ export type Step = {
   split?: { train: number; test: number; percent: number };
 };
 
+/** Values outside Tukey's fences for one numeric column. */
+export type Outliers = {
+  count: number;
+  share: number;
+  lower: number;
+  upper: number;
+};
+
+/** One row of the per-column flag table. */
+export type ColumnProfile = {
+  column: string;
+  kind: string;
+  kind_label: string;
+  dtype: string;
+  n_missing: number;
+  missing_rate: number;
+  n_unique: number;
+  unique_rate: number;
+  n_rows: number;
+  outliers: Outliers | null;
+  is_target: boolean;
+  used: boolean;
+  excluded_reason: string | null;
+  leakage: { correlation: number; reason: string } | null;
+  flags: string[];
+};
+
+export type CorrelatedPair = {
+  columns: string[];
+  correlation: number;
+  reason: string;
+};
+
+export type ClassBalance = {
+  ratio: number;
+  majority_class: string;
+  majority_share: number;
+  minority_class: string;
+  minority_count: number;
+  minority_share: number;
+  reason: string;
+};
+
+export type LeakageFlag = {
+  kind: string;
+  column: string;
+  correlation: number;
+  severity: string;
+  reason: string;
+};
+
+/** One line of the health score's arithmetic. */
+export type HealthDeduction = {
+  factor: string;
+  label: string;
+  amount: number;
+  weight: number;
+  cap: number;
+  points_lost: number;
+};
+
+export type Quality = {
+  score: number;
+  rows_used: number;
+  missing_cells: number;
+  duplicate_rows: number;
+  issues: { severity: string; text: string }[];
+  breakdown: HealthDeduction[];
+};
+
+export type Profile = {
+  dataset_id: string;
+  n_rows: number;
+  n_columns: number;
+  duplicate_rows: number;
+  quality: Quality;
+  columns: ColumnProfile[];
+  correlated_pairs: CorrelatedPair[];
+  leakage_flags: LeakageFlag[];
+  class_balance: ClassBalance | null;
+};
+
 export type Analysis = {
   run_id: string;
+  dataset_id: string;
   file: { name: string; rows: number; columns: number; encoding: string; delimiter: string };
   goal: string;
   target: {
@@ -33,13 +116,9 @@ export type Analysis = {
   };
   columns: string[];
   cleaning: string[];
-  quality: {
-    score: number;
-    rows_used: number;
-    missing_cells: number;
-    duplicate_rows: number;
-    issues: { severity: string; text: string }[];
-  };
+  quality: Quality;
+  profile: Profile;
+  options: { scaler: string; high_card_encoder: string };
   dropped: { column: string; reason: string }[];
   steps: Step[];
   result: { train_rows: number; test_rows: number; features: number };

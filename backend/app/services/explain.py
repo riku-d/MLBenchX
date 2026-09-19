@@ -638,7 +638,11 @@ def build_steps(raw: pd.DataFrame, result: PreprocessingResult) -> list[dict[str
         card.update({
             "stage": _STAGE_LABEL[stage],
             "columns": shown,
-            "fitted": True,
+            # The badge means "this step learned something, and only from training
+            # rows". Splitting a date into its parts learns nothing — every output
+            # depends on that row alone — so claiming the badge there would dilute it
+            # everywhere it is true.
+            "fitted": stage != "derive",
         })
         cards.append(card)
 

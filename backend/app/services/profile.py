@@ -19,7 +19,7 @@ from typing import Any
 
 import pandas as pd
 
-from app.config import OUTLIER_IQR_MULTIPLIER
+from app.config import MAX_MISSING_RATE, OUTLIER_IQR_MULTIPLIER
 from app.services.glassbox import ColumnProfile, profile_frame
 from app.services.screening import correlated_pairs
 
@@ -69,20 +69,27 @@ def outlier_summary(series: pd.Series) -> dict[str, Any] | None:
 
 
 def _flags(profile: ColumnProfile, outliers: dict | None, leaking: bool) -> list[str]:
-    """Short tags for the per-column table. Ordered most to least serious."""
+    """Short tags for the per-column table. Ordered most to least serious.
+
+    Only things the table's own numbers do not already say. The blank percentage and
+    the outlier count each have a column, so "has blanks" and "18 outliers" would be
+    the same fact twice — and a tag on every row is a tag that means nothing. What is
+    left is the reason a column's number matters: that it never varies, that it is too
+    empty to use, that it is an identifier, that it looks like the answer.
+    """
     tags: list[str] = []
     if leaking:
         tags.append("looks like the answer")
     if profile.kind == "constant":
         tags.append("never changes")
-    if profile.missing_rate >= 0.5:
+    if profile.missing_rate > MAX_MISSING_RATE:
+        tags.append("too empty to use")
+    elif profile.missing_rate >= 0.5:
         tags.append("mostly blank")
-    elif profile.missing_rate > 0:
-        tags.append("has blanks")
     if profile.kind == "text":
         tags.append("free text")
-    if outliers and outliers["count"]:
-        tags.append(f"{outliers['count']:,} outliers")
+    if profile.kind == "datetime":
+        tags.append("date/time")
     return tags
 
 
