@@ -84,6 +84,7 @@ from app.services.screening import (
     target_leakage_screen,
 )
 from app.storage import StorageError, get_storage
+from app.workspace import router as workspace_router
 from app.services.target import (
     class_balance,
     describe_task,
@@ -189,6 +190,9 @@ def _safe_filename(name: str, fallback: str) -> str:
     ascii_only = unicodedata.normalize("NFKD", stem).encode("ascii", "ignore").decode()
     cleaned = _UNSAFE_IN_FILENAME.sub("_", ascii_only).strip("._-")
     return cleaned[:80] or fallback
+
+
+app.include_router(workspace_router)
 
 
 @dataclass

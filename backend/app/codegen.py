@@ -196,6 +196,11 @@ for _column in list(DATETIME_COLUMNS):
     for _part, _period in (("year", None), ("month", 12), ("day", 31),
                            ("dayofweek", 7), ("hour", 24)):
         _values = getattr(_stamps.dt, _part).astype("float64").fillna(0.0)
+        # A part that never varies carries no information. Emitting it anyway — and its
+        # sine/cosine pair — would add three dead columns per part for a dataset
+        # recorded on a single day, which is worse than not splitting the date at all.
+        if _values.nunique() < 2:
+            continue
         df[f"{{_column}}_{{_part}}"] = _values
         NUMERIC_COLUMNS.append(f"{{_column}}_{{_part}}")
         if _period:

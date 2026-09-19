@@ -39,6 +39,7 @@ from typing import Any
 
 from sqlalchemy import (
     JSON,
+    Boolean,
     DateTime,
     Float,
     ForeignKey,
@@ -65,6 +66,9 @@ __all__ = [
     "Profile",
     "PreprocessingRun",
     "PreprocessingLog",
+    "Workspace",
+    "Compilation",
+    "HistoryEntry",
     "engine",
     "SessionLocal",
     "session_scope",
@@ -248,3 +252,111 @@ def init_db() -> None:
     because both are generated from the models above.
     """
     Base.metadata.create_all(engine)
+
+
+# --------------------------------------------------------------------------------------
+# The interactive workspace
+# --------------------------------------------------------------------------------------
+#
+# The tables above record what the glass-box engine did to a dataset. These three record
+# what the *user* is doing with it: the pipeline they have configured, the code they have
+# edited, every compile they have run, and the trail of changes that lets them go back.
+
+
+class Workspace(TimestampedProjectMixin, Base):
+    """One user's working state over one dataset.
+
+    Exactly one per dataset. A workspace holds the configuration and, separately, the
+    code — because the moment a user edits the code by hand the two can diverge, and
+    which one is authoritative becomes a fact the interface has to state rather than
+    guess. ``code_is_edited`` is that fact.
+    """
+
+    __tablename__ = "workspaces"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("datasets.id", ondelete="CASCADE"),
+        index=True, unique=True, nullable=False,
+    )
+    #: The PipelineConfig, as written by the toggles.
+    config: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    #: The code as it currently stands in the editor.
+    code: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    #: True once the user's code differs from what the config would generate. From then
+    #: on the code is what runs, and the workspace says so rather than letting the
+    #: toggles imply otherwise.
+    code_is_edited: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    #: The id of the last compile that succeeded, so "unsaved changes" is answerable.
+    last_compilation_id: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    #: Health of the dataset as uploaded, measured once.
+    baseline_health: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=_utcnow, onupdate=_utcnow, nullable=False
+    )
+
+    dataset: Mapped[Dataset] = relationship()
+    compilations: Mapped[list["Compilation"]] = relationship(
+        back_populates="workspace", cascade="all, delete-orphan",
+        order_by="Compilation.created_at.desc()",
+    )
+    history: Mapped[list["HistoryEntry"]] = relationship(
+        back_populates="workspace", cascade="all, delete-orphan",
+        order_by="HistoryEntry.created_at.desc()",
+    )
+
+
+class Compilation(TimestampedProjectMixin, Base):
+    """One execution of a pipeline — what ran, what it produced, what it cost.
+
+    Failures are rows here too. A compile that raised is something the user needs to
+    read, come back to, and compare against the one before it; discarding it because it
+    did not succeed would throw away the more interesting half of the history.
+    """
+
+    __tablename__ = "compilations"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    workspace_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("workspaces.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    status: Mapped[str] = mapped_column(String(16), nullable=False)  # success | error
+    #: Exactly what was executed, so a run can always be reproduced.
+    code: Mapped[str] = mapped_column(Text, nullable=False)
+    #: The config at the time, or null when the code had been hand-edited.
+    config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    source: Mapped[str] = mapped_column(String(16), nullable=False, default="pipeline")
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    logs: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    #: Shape before and after, and the per-step report the script emitted.
+    result: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    health_before: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    health_after: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    #: Storage key of the processed CSV, when one was produced.
+    output_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    sandbox: Mapped[str] = mapped_column(String(32), nullable=False, default="none")
+
+    workspace: Mapped[Workspace] = relationship(back_populates="compilations")
+
+
+class HistoryEntry(TimestampedProjectMixin, Base):
+    """One change the user made, and the state it produced.
+
+    Stores the whole configuration rather than a diff. A diff is smaller and would make
+    "restore this point" a replay of every entry since — which is fragile, and wrong the
+    first time an entry fails to apply. A config is a few hundred bytes.
+    """
+
+    __tablename__ = "history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    workspace_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("workspaces.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    kind: Mapped[str] = mapped_column(String(32), nullable=False)
+    summary: Mapped[str] = mapped_column(Text, nullable=False)
+    config: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+    code: Mapped[str | None] = mapped_column(Text, nullable=True)
+
+    workspace: Mapped[Workspace] = relationship(back_populates="history")
