@@ -354,3 +354,59 @@ def test_the_log_stays_json_serialisable_with_every_option(frame) -> None:
             )
             json.dumps(result.log)
             json.dumps(result.flags)
+
+
+# --------------------------------------------------------------------------------------
+# Date recognition on the way in
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "values,should_convert",
+    [
+        (["2024-01-05", "2024-02-06", "2024-03-07"], True),
+        (["01/05/2024", "02/06/2024", "03/07/2024"], True),
+        (["2024-01-05 14:30", "2024-02-06 09:15", "2024-03-07 23:00"], True),
+        (["5.1.2024", "6.2.2024", "7.3.2024"], True),
+        # The dangerous near-misses. Turning any of these into 1970 timestamps would
+        # destroy the column silently, which is worse than missing a date.
+        (["2000", "2001", "2002"], False),
+        (["1.2.3", "4.5.6", "7.8.9"], False),
+        (["12", "7", "99"], False),
+        (["1/2", "3/4", "5/6"], False),
+        (["2024-01-05", "not a date", "2024-03-07"], False),
+    ],
+)
+def test_only_genuine_dates_are_parsed_as_dates(values, should_convert) -> None:
+    from app.services.ingest import _coerce_datetime
+
+    df = pd.DataFrame({"col": values * 30})
+    converted = _coerce_datetime(df)
+
+    assert bool(converted) is should_convert
+    if should_convert:
+        assert pd.api.types.is_datetime64_any_dtype(df["col"])
+    else:
+        assert df["col"].dtype == object
+
+
+def test_a_date_column_in_an_uploaded_csv_becomes_calendar_features() -> None:
+    """The end-to-end path: a CSV has no dtypes, so this only works if ingest parses."""
+    from app.services.ingest import read_upload
+
+    rng = np.random.default_rng(21)
+    n = 200
+    csv = pd.DataFrame({
+        "signed_up": pd.to_datetime("2022-01-01")
+        + pd.to_timedelta(rng.integers(0, 700, n), unit="D"),
+        "amount": rng.normal(100, 20, n),
+        "label": rng.choice([0, 1], n),
+    }).to_csv(index=False).encode("utf-8")
+
+    ingested = read_upload(csv, "dates.csv")
+    assert pd.api.types.is_datetime64_any_dtype(ingested.frame["signed_up"])
+    assert "signed_up" in ingested.datetime_columns
+
+    result = fit_preprocessing(ingested.frame, "label", "classification")
+    assert result.plan.datetime == ["signed_up"]
+    assert "signed_up_month_sin" in result.X_train.columns

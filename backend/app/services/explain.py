@@ -537,10 +537,26 @@ def _datetime_card(entry: dict, train_raw: pd.DataFrame) -> dict[str, Any]:
     raw_values = [train_raw.at[label, lead] for label in labels]
     stamps = pd.to_datetime(pd.Series(raw_values), errors="coerce")
 
-    def described(stamp: Any) -> str:
+    def shown(stamp: Any) -> str:
+        """The timestamp as it was, to the minute.
+
+        Not trimmed to the date: the hour is one of the parts extracted, so hiding it
+        here would show three apparently identical values turning into three different
+        results — which reads as the strip being broken rather than as the step working.
+        """
         if pd.isna(stamp):
             return "—"
-        return f"{stamp.strftime('%b')} · {stamp.strftime('%a')} · {stamp.year}"
+        return pd.Timestamp(stamp).strftime("%Y-%m-%d %H:%M")
+
+    def described(stamp: Any) -> str:
+        """The same instant as the parts a model will actually see."""
+        if pd.isna(stamp):
+            return "—"
+        moment = pd.Timestamp(stamp)
+        return (
+            f"{moment.strftime('%b')} · {moment.strftime('%a')} · "
+            f"{moment.strftime('%H:%M')} · {moment.year}"
+        )
 
     return {
         "title": "Broke dates into parts a model can use",
@@ -551,8 +567,8 @@ def _datetime_card(entry: dict, train_raw: pd.DataFrame) -> dict[str, Any]:
         },
         "strip": _strip(
             labels,
-            [_fmt(v) if pd.isna(v) else str(pd.Timestamp(v).date()) for v in raw_values],
-            [described(stamp) for stamp in stamps],
+            [shown(v) for v in raw_values],
+            [described(v) for v in raw_values],
             [True] * len(labels),
             lead,
         ),

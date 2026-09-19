@@ -87,6 +87,8 @@ class IngestResult:
     #: Columns that were stored as text and converted to numbers. Recorded so the
     #: exported script can repeat the same conversion.
     numeric_columns: list[str] = field(default_factory=list)
+    #: Columns that were stored as text and recognised as dates, for the same reason.
+    datetime_columns: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------------------
@@ -174,6 +176,60 @@ def _coerce_numeric(df: pd.DataFrame) -> list[str]:
             errors="coerce",
         )
         df[column] = rebuilt
+        converted.append(str(column))
+    return converted
+
+
+#: A value has to look like a date before we try to parse it as one, and the test is a
+#: **four-digit year** at one end or the other. Without that anchor pandas reads a
+#: version number like ``1.2.3`` as the 3rd of February 2001 and a bare ``2019`` as a
+#: timestamp — a column of software versions or scores would become dates, silently.
+#: Requiring the year rules those out while still accepting every common written form:
+#: ``2024-01-05``, ``05/01/2024``, ``5.1.2024``, each with an optional time.
+_DATE_SHAPED = re.compile(
+    r"^\s*(?:"
+    r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}"      # year first: 2024-01-05
+    r"|\d{1,2}[-/.]\d{1,2}[-/.]\d{4}"     # year last:  05/01/2024
+    r")"
+    r"(?:[ T]\d{1,2}:\d{2}(?::\d{2})?)?"  # optional time
+    r"\s*$"
+)
+
+
+def _coerce_datetime(df: pd.DataFrame) -> list[str]:
+    """Convert text columns that are really dates.
+
+    Without this the calendar features never run on an uploaded file: a CSV has no
+    dtypes, so ``2012-04-10`` arrives as an ordinary string and profiles as a category.
+    A date column would then be one-hot encoded into a column per distinct timestamp,
+    which is both useless and enormous.
+
+    The bar is deliberately high — every non-blank value must match a real date shape
+    *and* parse — because the failure mode in the other direction is worse. A column of
+    version numbers or scores turned into 1970 timestamps is data destroyed silently,
+    where a date left as a category is merely a missed opportunity that the dropped- or
+    encoded-column list still reports.
+    """
+    converted: list[str] = []
+    for column in df.columns:
+        series = df[column]
+        if series.dtype != object:
+            continue
+        non_null = series.dropna()
+        if non_null.empty:
+            continue
+
+        as_text = non_null.astype("string")
+        if not as_text.str.match(_DATE_SHAPED).all():
+            continue
+
+        parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=False)
+        # Every value that had something in it must have parsed, or this is not a date
+        # column and we would be turning real values into blanks.
+        if int(parsed.isna().sum()) != int(series.isna().sum()):
+            continue
+
+        df[column] = parsed
         converted.append(str(column))
     return converted
 
@@ -409,6 +465,14 @@ def read_upload(raw: bytes, filename: str) -> IngestResult:
             f"numbers: {shown}"
         )
 
+    dates = _coerce_datetime(frame)
+    if dates:
+        shown = ", ".join(dates[:4]) + (" and others" if len(dates) > 4 else "")
+        cleaning.append(
+            f"Recognised {_plural(len(dates), 'column')} as dates rather than text: "
+            f"{shown}"
+        )
+
     if len(frame) < MIN_ROWS:
         raise IngestError(
             f"That file has {_plural(len(frame), 'row')}. We need at least {MIN_ROWS} to set some "
@@ -436,6 +500,7 @@ def read_upload(raw: bytes, filename: str) -> IngestResult:
         quality_score=score,
         quality_breakdown=breakdown,
         numeric_columns=converted,
+        datetime_columns=dates,
     )
 
 
@@ -470,6 +535,7 @@ def loader_source(result: IngestResult) -> tuple[str, str]:
 # and happen before the split.
 MISSING_TOKENS = {tokens!r}
 TEXT_NUMBER_COLUMNS = {result.numeric_columns!r}
+TEXT_DATE_COLUMNS = {result.datetime_columns!r}
 NUMERIC_NOISE = r"[,\\s ₹$€£%]"
 
 
@@ -492,6 +558,11 @@ def load_frame() -> pd.DataFrame:
                 df[column].astype("string").str.strip().str.replace(NUMERIC_NOISE, "", regex=True)
             )
             df[column] = pd.to_numeric(cleaned, errors="coerce")
+
+    # Columns stored as text that are really dates.
+    for column in TEXT_DATE_COLUMNS:
+        if column in df.columns:
+            df[column] = pd.to_datetime(df[column], errors="coerce", format="mixed")
 
     return df
 
