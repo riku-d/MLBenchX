@@ -1,0 +1,356 @@
+"""One test per preprocessing rule added or changed in the Phase 1 audit.
+
+Each test names the rule it is defending and fails for exactly one reason. Where a test
+exists to prove an *absence* — that the test fold never reached a fit, that a flagged
+column was not dropped — it is written so that the obvious wrong implementation makes it
+fail, rather than so that the right one makes it pass.
+"""
+
+from __future__ import annotations
+
+import json
+
+import numpy as np
+import pandas as pd
+import pytest
+
+from app.config import (
+    HIGH_CORRELATION,
+    LEAKAGE_CORRELATION,
+    ONEHOT_MAX_CARDINALITY,
+)
+from app.services.glassbox import (
+    DatetimeFeatures,
+    build_plan,
+    fit_preprocessing,
+    profile_frame,
+)
+from app.services.profile import outlier_summary
+from app.services.screening import (
+    correlated_pairs,
+    identifier_screen,
+    target_leakage_screen,
+)
+from app.services.target import class_balance, describe_task
+
+N = 300
+
+
+@pytest.fixture
+def frame() -> pd.DataFrame:
+    rng = np.random.default_rng(7)
+    return pd.DataFrame({
+        "amount": np.round(rng.gamma(4, 25, N), 2),
+        "tier": rng.choice(["bronze", "silver", "gold"], N),
+        "region": rng.choice([f"r{i:02d}" for i in range(30)], N),
+        "active": rng.choice([True, False], N),
+        "joined": pd.to_datetime("2021-01-01") + pd.to_timedelta(rng.integers(0, 900, N), unit="D"),
+        "label": rng.choice([0, 1], N, p=[0.45, 0.55]),
+    })
+
+
+# --------------------------------------------------------------------------------------
+# Scaler selection
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "scaler,expected",
+    [("standard", "StandardScaler"), ("minmax", "MinMaxScaler"), ("robust", "RobustScaler")],
+)
+def test_each_scaler_is_used_and_named_in_the_log(frame, scaler, expected) -> None:
+    result = fit_preprocessing(frame, "label", "classification", scaler=scaler)
+    step = next(e for e in result.log if e["stage"] == "scale")
+    assert step["transformer"] == expected
+    assert type(result.pipeline.named_transformers_["numeric"].named_steps["scale"]).__name__ == expected
+
+
+def test_minmax_puts_training_values_in_zero_to_one(frame) -> None:
+    result = fit_preprocessing(frame, "label", "classification", scaler="minmax")
+    values = result.X_train["amount"]
+    assert values.min() == pytest.approx(0.0, abs=1e-9)
+    assert values.max() == pytest.approx(1.0, abs=1e-9)
+
+
+def test_robust_centres_on_the_training_median(frame) -> None:
+    result = fit_preprocessing(frame, "label", "classification", scaler="robust")
+    entry = next(e for e in result.log if e["stage"] == "scale")
+    scaler = result.pipeline.named_transformers_["numeric"].named_steps["scale"]
+    # The logged centre is read off the fitted object, not recomputed alongside it.
+    assert entry["details"]["mean"]["amount"] == pytest.approx(float(scaler.center_[0]))
+
+
+def test_an_unknown_scaler_is_refused_by_name(frame) -> None:
+    with pytest.raises(ValueError, match="scaler must be one of"):
+        fit_preprocessing(frame, "label", "classification", scaler="quantile")
+
+
+# --------------------------------------------------------------------------------------
+# High-cardinality encoding
+# --------------------------------------------------------------------------------------
+
+
+def test_frequency_is_the_default_and_never_reads_the_target(frame) -> None:
+    result = fit_preprocessing(frame, "label", "classification")
+    entry = next(e for e in result.log if e["stage"] == "encode" and e["columns"] == ["region"])
+    assert entry["transformer"] == "FrequencyEncoder"
+    # Frequencies must sum to 1 across the training fold — a target mean would not.
+    table = entry["details"]["frequencies"]["region"]
+    assert sum(table.values()) == pytest.approx(1.0)
+
+
+def test_target_encoding_is_selectable_and_cross_fitted(frame) -> None:
+    result = fit_preprocessing(
+        frame, "label", "classification", high_card_encoder="target"
+    )
+    entry = next(e for e in result.log if e["transformer"] == "TargetEncoder")
+    encoder = result.pipeline.named_transformers_["high_card"].named_steps["encode"]
+
+    assert entry["details"]["cv"] == encoder.cv
+    # The training output is the cross-fitted one, so a row's encoded value is not the
+    # mean of the category it belongs to. If it were, this would be exact for every row.
+    merged = pd.DataFrame({
+        "encoded": result.X_train["region"].to_numpy(),
+        "category": frame.loc[result.X_train.index, "region"].to_numpy(),
+    })
+    full_means = merged.groupby("category")["encoded"].transform("mean")
+    assert not np.allclose(merged["encoded"], full_means)
+
+
+def test_high_card_columns_cost_one_column_each(frame) -> None:
+    result = fit_preprocessing(frame, "label", "classification")
+    assert result.plan.high_card == ["region"]
+    assert sum(1 for c in result.X_train.columns if c.startswith("region")) == 1
+
+
+def test_the_onehot_threshold_is_the_configured_one() -> None:
+    profiles = profile_frame(pd.DataFrame({
+        "at_limit": [f"v{i % ONEHOT_MAX_CARDINALITY}" for i in range(N)],
+        "over_limit": [f"v{i % (ONEHOT_MAX_CARDINALITY + 1)}" for i in range(N)],
+        "y": [0, 1] * (N // 2),
+    }))
+    plan = build_plan(profiles, target="y", task_type="classification")
+    assert plan.low_card == ["at_limit"]
+    assert plan.high_card == ["over_limit"]
+
+
+# --------------------------------------------------------------------------------------
+# Datetime features
+# --------------------------------------------------------------------------------------
+
+
+def test_datetime_columns_become_calendar_features_not_drops(frame) -> None:
+    result = fit_preprocessing(frame, "label", "classification")
+    assert result.plan.datetime == ["joined"]
+    assert "joined" not in result.plan.dropped
+
+    produced = [c for c in result.X_train.columns if c.startswith("joined_")]
+    for part in ("year", "month", "day", "dayofweek", "hour"):
+        assert f"joined_{part}" in produced
+    for part in ("month", "day", "dayofweek", "hour"):
+        assert f"joined_{part}_sin" in produced and f"joined_{part}_cos" in produced
+
+
+def test_cyclical_encoding_puts_december_next_to_january() -> None:
+    """The whole point of the sine/cosine pair, stated as a distance."""
+    stamps = pd.DataFrame({"t": pd.to_datetime(["2024-12-15", "2024-01-15", "2024-06-15"])})
+    out = DatetimeFeatures().fit(stamps).transform(stamps)
+
+    def point(row: int) -> np.ndarray:
+        return np.array([out.iloc[row]["t_month_sin"], out.iloc[row]["t_month_cos"]])
+
+    dec_to_jan = np.linalg.norm(point(0) - point(1))
+    dec_to_jun = np.linalg.norm(point(0) - point(2))
+    assert dec_to_jan < dec_to_jun
+
+    # The raw month numbers say the opposite, which is why the pair is needed at all.
+    assert abs(12 - 1) > abs(12 - 6)
+
+
+def test_a_blank_timestamp_produces_no_blank_features() -> None:
+    stamps = pd.DataFrame({"t": pd.to_datetime(["2024-03-01", None, "2024-09-09"])})
+    out = DatetimeFeatures().fit(stamps).transform(stamps)
+    assert not out.isna().any().any()
+
+
+def test_datetime_features_map_back_to_their_source_column(frame) -> None:
+    result = fit_preprocessing(frame, "label", "classification")
+    derived = {k: v for k, v in result.feature_map.items() if k.startswith("joined_")}
+    assert derived and set(derived.values()) == {"joined"}
+
+
+# --------------------------------------------------------------------------------------
+# Leakage screen — flag, never drop
+# --------------------------------------------------------------------------------------
+
+
+def test_a_copy_of_the_target_is_flagged_and_kept(frame) -> None:
+    leaked = frame.copy()
+    rng = np.random.default_rng(0)
+    leaked["score"] = leaked["label"] * 100 + rng.normal(0, 0.01, len(leaked))
+
+    result = fit_preprocessing(
+        leaked, "label", "classification", screeners=[target_leakage_screen]
+    )
+
+    flagged = [f["column"] for f in result.flags]
+    assert "score" in flagged
+    assert abs(result.flags[0]["correlation"]) >= LEAKAGE_CORRELATION
+    # Flagged, not dropped — the spec's word, and the user's decision.
+    assert "score" not in result.plan.dropped
+    assert "score" in result.plan.numeric
+
+
+def test_an_ordinary_feature_is_not_flagged(frame) -> None:
+    result = fit_preprocessing(
+        frame, "label", "classification", screeners=[target_leakage_screen]
+    )
+    assert result.flags == []
+
+
+def test_the_leakage_screen_reads_only_the_training_fold(frame) -> None:
+    """Planting a perfect copy in the held-out rows only must not trigger the screen."""
+    leaked = frame.copy()
+    leaked["sneaky"] = np.random.default_rng(2).normal(size=len(leaked))
+
+    result = fit_preprocessing(
+        leaked, "label", "classification", screeners=[target_leakage_screen]
+    )
+    test_rows = result.X_test.index
+    leaked.loc[test_rows, "sneaky"] = leaked.loc[test_rows, "label"].astype(float)
+
+    again = fit_preprocessing(
+        leaked, "label", "classification", screeners=[target_leakage_screen]
+    )
+    assert "sneaky" not in [f["column"] for f in again.flags]
+
+
+# --------------------------------------------------------------------------------------
+# Correlated pairs and outliers
+# --------------------------------------------------------------------------------------
+
+
+def test_redundant_columns_are_reported_as_a_pair() -> None:
+    rng = np.random.default_rng(5)
+    base = rng.normal(size=N)
+    df = pd.DataFrame({
+        "metres": base,
+        "centimetres": base * 100 + rng.normal(0, 1e-6, N),
+        "unrelated": rng.normal(size=N),
+    })
+    pairs = correlated_pairs(df)
+    assert [set(p["columns"]) for p in pairs] == [{"metres", "centimetres"}]
+    assert abs(pairs[0]["correlation"]) >= HIGH_CORRELATION
+
+
+def test_iqr_outliers_are_counted_against_tukeys_fences() -> None:
+    values = pd.Series(list(range(1, 101)) + [10_000, -10_000])
+    summary = outlier_summary(values)
+    assert summary is not None and summary["count"] == 2
+
+
+def test_a_column_with_no_spread_reports_no_outliers() -> None:
+    """A collapsed IQR would otherwise condemn every value that is not the mode."""
+    summary = outlier_summary(pd.Series([5] * 90 + [6] * 10))
+    assert summary is not None and summary["count"] == 0
+
+
+def test_text_columns_have_no_outlier_summary() -> None:
+    assert outlier_summary(pd.Series(["a", "b", "c"])) is None
+
+
+# --------------------------------------------------------------------------------------
+# Task detection and class balance
+# --------------------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "series,expected",
+    [
+        (pd.Series([0, 1] * 50), "binary classification"),
+        (pd.Series(["yes", "no"] * 50), "binary classification"),
+        (pd.Series([f"c{i % 5}" for i in range(100)]), "multiclass classification"),
+        # The audit's bug: 30 text categories used to be called regression, which
+        # silently disabled stratification.
+        (pd.Series([f"c{i % 30}" for i in range(300)]), "multiclass classification"),
+        (pd.Series(np.linspace(0.5, 99.5, 200)), "regression"),
+        (pd.Series(np.arange(200)), "regression"),
+    ],
+)
+def test_task_detection(series, expected) -> None:
+    assert describe_task(series) == expected
+
+
+def test_a_lopsided_target_is_reported_with_its_ratio() -> None:
+    balance = class_balance(pd.Series(["no"] * 95 + ["yes"] * 5))
+    assert balance is not None
+    assert balance["ratio"] == pytest.approx(19.0)
+    assert balance["minority_class"] == "yes"
+
+
+def test_a_balanced_target_is_not_reported() -> None:
+    assert class_balance(pd.Series(["a"] * 50 + ["b"] * 50)) is None
+
+
+# --------------------------------------------------------------------------------------
+# Identifier screen
+# --------------------------------------------------------------------------------------
+
+
+def test_identifiers_are_screened_out_on_the_training_fold(frame) -> None:
+    withid = frame.copy()
+    withid.insert(0, "record_id", [f"ID{i:05d}" for i in range(len(withid))])
+
+    result = fit_preprocessing(
+        withid, "label", "classification", screeners=[identifier_screen]
+    )
+    assert "record_id" in result.excluded
+    assert "record_id" not in result.X_train.columns
+
+
+def test_a_caller_exclusion_still_wins(frame) -> None:
+    result = fit_preprocessing(
+        frame, "label", "classification",
+        excluded={"amount": "you deselected this column"},
+        screeners=[identifier_screen],
+    )
+    assert result.plan.dropped["amount"] == "you deselected this column"
+
+
+# --------------------------------------------------------------------------------------
+# Log record shape
+# --------------------------------------------------------------------------------------
+
+
+def test_every_log_record_carries_the_spec_fields(frame) -> None:
+    result = fit_preprocessing(frame, "label", "classification")
+    assert result.log
+    for entry in result.log:
+        for field in ("step", "column", "action", "params", "reason", "before", "after"):
+            assert field in entry, f"{field} missing from {entry['stage']} record"
+        assert entry["reason"] and entry["reason"][0].isupper()
+        assert entry["before"]["n_columns"] >= 1
+        assert entry["after"]["n_columns"] >= 1
+
+
+def test_impute_records_claim_no_blanks_afterwards(frame) -> None:
+    holes = frame.copy()
+    holes.loc[holes.index[:40], "amount"] = np.nan
+    result = fit_preprocessing(holes, "label", "classification")
+
+    entry = next(e for e in result.log if e["stage"] == "impute" and "amount" in e["columns"])
+    assert entry["before"]["missing_values"] > 0
+    assert entry["after"]["missing_values"] == 0
+    assert not result.X_train.isna().any().any()
+
+
+def test_the_log_stays_json_serialisable_with_every_option(frame) -> None:
+    for scaler in ("standard", "minmax", "robust"):
+        for encoder in ("frequency", "target"):
+            result = fit_preprocessing(
+                frame, "label", "classification",
+                scaler=scaler, high_card_encoder=encoder,
+                screeners=[identifier_screen, target_leakage_screen],
+            )
+            json.dumps(result.log)
+            json.dumps(result.flags)

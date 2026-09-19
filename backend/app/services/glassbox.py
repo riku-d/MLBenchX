@@ -119,6 +119,7 @@ __all__ = [
     "Screener",
     "FrequencyEncoder",
     "DatetimeFeatures",
+    "CategoricalCast",
     "StepPlan",
     "PreprocessingPlan",
     "PreprocessingResult",
@@ -286,6 +287,50 @@ class FrequencyEncoder(TransformerMixin, BaseEstimator):
         check_is_fitted(self, "frequencies_")
         names = list(self.feature_names_in_) if input_features is None else list(input_features)
         return np.asarray([f"{name}_freq" for name in names], dtype=object)
+
+
+class CategoricalCast(TransformerMixin, BaseEstimator):
+    """Present categorical columns to the encoders as plain objects.
+
+    ``SimpleImputer`` refuses a ``bool`` column outright, and pandas' nullable extension
+    dtypes (``boolean``, ``Int64``, ``string``) reach sklearn as masked arrays it does
+    not expect. A file with a real ``True``/``False`` column would otherwise fail the
+    whole run with a dtype error that says nothing about the user's data.
+
+    Casting to ``object`` is lossless for the encoders downstream: every one of them —
+    ordinal, one-hot, frequency, target — works from distinct values, and ``True`` as an
+    object is exactly as distinct from ``False`` as it was before. Numeric columns never
+    reach this transformer; they have their own block.
+
+    It learns nothing, so it cannot leak. It is still inside the fitted pipeline so the
+    exported script and any later ``transform`` apply the same cast.
+    """
+
+    def fit(self, X: Any, y: Any = None) -> "CategoricalCast":
+        frame = X if isinstance(X, pd.DataFrame) else pd.DataFrame(X)
+        self.feature_names_in_ = np.asarray(list(frame.columns), dtype=object)
+        self.n_features_in_ = frame.shape[1]
+        return self
+
+    def transform(self, X: Any) -> pd.DataFrame:
+        check_is_fitted(self, "feature_names_in_")
+        frame = X if isinstance(X, pd.DataFrame) else pd.DataFrame(
+            X, columns=list(self.feature_names_in_)
+        )
+        out = frame.copy()
+        for column in out.columns:
+            if not pd.api.types.is_numeric_dtype(out[column]) or pd.api.types.is_bool_dtype(
+                out[column]
+            ):
+                # `where(notna)` keeps real blanks as NaN for the imputer to find,
+                # rather than turning them into the string "nan" or "<NA>".
+                out[column] = out[column].astype(object).where(out[column].notna(), np.nan)
+        return out
+
+    def get_feature_names_out(self, input_features: Any = None) -> np.ndarray:
+        check_is_fitted(self, "feature_names_in_")
+        names = list(self.feature_names_in_) if input_features is None else list(input_features)
+        return np.asarray(names, dtype=object)
 
 
 class DatetimeFeatures(TransformerMixin, BaseEstimator):
@@ -660,7 +705,7 @@ def _block(group: str, plan: PreprocessingPlan) -> Pipeline:
         )
     else:  # pragma: no cover - guarded by GROUP_ORDER
         raise ValueError(f"unknown column group: {group!r}")
-    return Pipeline([("impute", imputer), ("encode", encoder)])
+    return Pipeline([("cast", CategoricalCast()), ("impute", imputer), ("encode", encoder)])
 
 
 def build_pipeline(plan: PreprocessingPlan) -> ColumnTransformer:
@@ -1405,18 +1450,21 @@ def _block_source(plan: PreprocessingPlan) -> str:
         ),
         "binary": (
             '    blocks.append(("binary", Pipeline([\n'
+            '        ("cast", CategoricalCast()),\n'
             '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
             '        ("encode", OrdinalEncoder(handle_unknown="use_encoded_value", unknown_value=-1)),\n'
             '    ]), BINARY))\n'
         ),
         "low_card": (
             '    blocks.append(("low_card", Pipeline([\n'
+            '        ("cast", CategoricalCast()),\n'
             '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
             '        ("encode", OneHotEncoder(handle_unknown="ignore", sparse_output=False)),\n'
             '    ]), LOW_CARD))\n'
         ),
         "high_card": (
             '    blocks.append(("high_card", Pipeline([\n'
+            '        ("cast", CategoricalCast()),\n'
             '        ("impute", SimpleImputer(strategy="most_frequent", keep_empty_features=True)),\n'
             f'        ("encode", {high_card_encoder}),\n'
             '    ]), HIGH_CARD))\n'
@@ -1473,6 +1521,8 @@ def export_script(
     # never copied into a string literal, so the export cannot drift from the code that
     # actually ran.
     embedded: list[Any] = []
+    if plan.binary or plan.low_card or plan.high_card:
+        embedded.append(CategoricalCast)
     if plan.high_card and plan.high_card_encoder == "frequency":
         embedded.append(FrequencyEncoder)
     if plan.datetime:
