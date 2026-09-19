@@ -1223,6 +1223,13 @@ class PreprocessingResult:
     #: Columns a screener flagged as suspicious without removing them — currently the
     #: target-leakage screen. Flagged columns are still used as features, by design.
     flags: list[dict[str, Any]] = field(default_factory=list)
+    #: The split parameters actually used. Recorded rather than recovered: deriving
+    #: test_size back from the row counts rounds, and a rounded fraction re-enters
+    #: `train_test_split` as a different ceiling — an 891-row file exported at 0.2009
+    #: instead of 0.2 splits 711/180 where the app split 712/179. One row is enough to
+    #: make "this script reproduces exactly what you were shown" false.
+    test_size: float = TEST_SIZE
+    seed: int = SEED
 
 
 def _is_classification(task_type: str) -> bool:
@@ -1349,6 +1356,8 @@ def fit_preprocessing(
         feature_map=feature_map,
         excluded=removals,
         flags=flags,
+        test_size=test_size,
+        seed=seed,
     )
 
 
@@ -1502,10 +1511,9 @@ def export_script(
         result: the outcome of :func:`fit_preprocessing`.
         csv: path the generated script should read the dataset from.
         exp_id: experiment identifier, recorded in the file's docstring.
-        seed: the seed passed to :func:`fit_preprocessing`. It is not recoverable from
-            :class:`PreprocessingResult`, whose fields are fixed by the module contract,
-            so callers that override the default must pass the same value here for the
-            export to reproduce their split.
+        seed: the seed to write into the script. Defaults to the module's, but
+            :attr:`PreprocessingResult.seed` records what the run actually used and is
+            what callers should pass.
         loader_block: optional Python source defining how to read the file — separator,
             encoding, and any repairs applied before preprocessing. Without it the
             script assumes a plain comma-separated file, which will not reproduce the
@@ -1550,7 +1558,7 @@ def export_script(
         csv=csv,
         target=plan.target,
         task_type="classification" if _is_classification(plan.task_type) else "regression",
-        test_size=round(len(result.X_test) / (len(result.X_train) + len(result.X_test)), 4),
+        test_size=result.test_size,
         seed=seed,
         dropped=_pretty_dict(plan.dropped),
         numeric=_pretty_list(plan.numeric),

@@ -1,120 +1,165 @@
 # ML-BenchX — Phase 1 audit
 
-Audited 2026-09-19 against the Phase 1 spec. Baseline: 49 pytest tests pass,
-`npm run build` succeeds, no git repository initialised.
+Audited 2026-09-19 against the Phase 1 spec, remediated 2026-09-20.
 
-Legend: ✅ present and correct · ⚠️ present but incomplete/deviating · ❌ absent
+**Final status: every spec item is implemented.** 137 tests pass, the backend starts,
+the frontend builds, and an end-to-end run against `tests/fixtures/titanic.csv`
+completes over HTTP. Work landed in six commits, one per area.
+
+Legend: ✅ done · ⚠️ partial · ❌ absent. The **Was** column is the state at audit time;
+**Now** is the state after remediation.
 
 ## Spec coverage
 
-| Area | Spec item | | Where | Fix |
+| Area | Spec item | Was | Now | Where |
 |---|---|---|---|---|
-| Ingest | CSV/XLSX read | ✅ | `backend/app/services/ingest.py:278` | — |
-| Ingest | Encoding check | ✅ | `ingest.py:97` | — |
-| Ingest | Size cap, configurable, default 50 MB | ⚠️ | `backend/app/main.py:44` | 25 MB hardcoded; move to config, default 50 MB |
-| Ingest | Cap enforced before body is buffered | ❌ | `main.py:261` | `await file.read()` buffers the whole upload, *then* checks size. Stream with a running cap |
-| Ingest | Infer numeric/categorical/datetime/ID-like/constant | ⚠️ | `glassbox.py:146` + `screening.py:55` | All five kinds exist but ID-like lives in a second module and never reaches `ColumnProfile`; datetime is detected then dropped |
-| Profile | Per-column missing %, cardinality | ⚠️ | `glassbox.py:160` | Computed in `ColumnProfile` but never exposed by the API or UI |
-| Profile | IQR outliers per column | ❌ | — | Not implemented |
-| Profile | Duplicate rows | ✅ | `ingest.py:381` | — |
-| Profile | High-corr pairs \|r\|>0.9 | ❌ | — | Not implemented |
-| Profile | Class imbalance | ⚠️ | `target.py:177` | Value counts returned; no imbalance flag or threshold |
-| Profile | Health score 0–100, documented weighted formula | ⚠️ | `ingest.py:214` | Score exists; weights are literals inside the function and documented nowhere |
-| Task | binary / multiclass / regression | ⚠️ | `target.py:165` | **Bug**: a text target with 21–50 distinct values returns `"regression"` |
-| Prep | Split 80/20 first, stratified | ✅ | `glassbox.py:857` | — |
-| Prep | Fit on train only, transform both | ✅ | `glassbox.py:869` | Single `fit_transform`, proven by `test_glassbox.py:199` |
-| Prep | Routing decided from train only | ⚠️ | `glassbox.py:846` | `profile_frame` and `find_identifier_columns` read the **full** frame, so test-row cardinality can flip a routing decision |
-| Prep | sklearn Pipeline / ColumnTransformer | ✅ | `glassbox.py:475` | — |
-| Prep | Persist fitted pipeline (joblib) | ❌ | — | Pipeline lives only in an in-process dict |
-| Prep | Impute median (num) / mode (cat) | ✅ | `glassbox.py:452` | — |
-| Prep | Binary → label encode | ✅ | `glassbox.py:465` | — |
-| Prep | Low-card (≤10, configurable) → one-hot, `handle_unknown="ignore"` | ⚠️ | `glassbox.py:105` | Correct encoder; threshold is 15, hardcoded |
-| Prep | High-card → cross-fitted TargetEncoder | ⚠️ | `glassbox.py:190` | Deliberately replaced by `FrequencyEncoder`; documented, but the spec's encoder is absent and not selectable |
-| Prep | Scale: Standard default, MinMax/Robust selectable | ⚠️ | `glassbox.py:462` | Standard hardcoded; no option plumbed from the API |
-| Prep | Datetime → y/m/dow/hour + sin/cos | ❌ | `glassbox.py:389` | Datetime columns are dropped with a reason |
-| Prep | Leakage flag \|r\|>0.99 with target | ❌ | — | Not implemented. `screening.py` catches identifiers only |
-| Prep | Drop constant + ID-like with logged reason | ✅ | `glassbox.py:383`, `screening.py:84` | — |
-| Log | JSON record per step | ⚠️ | `glassbox.py:734` | Serialisable and derived from fitted objects (good), but shape is `{step, stage, columns, transformer, params, fitted_on, reason, details, explanation}` — no `action`, no `before`/`after` |
-| API | `POST /datasets` | ❌ | — | Only `POST /api/analyse` (one-shot, nothing persisted) |
-| API | `GET /datasets/{id}` | ❌ | — | — |
-| API | `GET /datasets/{id}/profile` | ❌ | — | — |
-| API | `POST /datasets/{id}/preprocess` (target, scaler, options) | ❌ | — | No scaler/option parameters anywhere |
-| API | `GET /datasets/{id}/preprocess/log` | ❌ | — | — |
-| API | Pydantic schemas | ❌ | `main.py:254` | Every route returns bare `dict[str, Any]`; no response models, no OpenAPI shape |
-| API | Correct 4xx errors | ✅ | `main.py:105` | 400 for user errors, 404 for missing runs, handlers tested |
-| DB | SQLAlchemy 2.x + Alembic on SQLite | ❌ | `main.py:82` | In-memory `OrderedDict`, capped at 20 runs |
-| DB | `datasets`, `profiles`, `preprocessing_runs`, `preprocessing_logs` | ❌ | — | — |
-| DB | `project_id` + `created_at` on every table | ❌ | — | — |
-| Storage | `StorageBackend` interface + `LocalStorage` | ❌ | — | Uploaded bytes are never written to disk |
-| UI | Upload page | ✅ | `frontend/src/components/Upload.tsx` | — |
-| UI | Profile dashboard: health score | ✅ | `Results.tsx:159` | — |
-| UI | Profile dashboard: per-column flag table | ❌ | `Results.tsx:109` | Only a list of column names; no per-column missing %, cardinality, outliers or flags |
-| UI | Glass-box log, card per step, reason + before→after | ✅ | `StepCard.tsx`, `TransformStrip.tsx` | The strongest part of the build |
-| Config | All thresholds in one module | ❌ | — | Spread over `glassbox.py:104-125`, `ingest.py:39`, `screening.py:24`, `main.py:44-51`, `explain.py:35` |
-| Tests | One per preprocessing rule | ✅ | `tests/test_glassbox.py` | 24 tests, rule-by-rule |
-| Tests | Leakage: test-split stats never reach fit | ✅ | `test_glassbox.py:199`, `:227` | Fit-spy on row indices + train-vs-global median check. Best test in the suite |
-| Tests | API happy path + bad file | ✅ | `test_app.py:172`, `:242` | — |
-| Tests | `tests/fixtures` dataset | ❌ | — | Tests build frames inline; no fixture file |
+| Ingest | CSV/XLSX read | ✅ | ✅ | `ingest.py:278` |
+| Ingest | Encoding check | ✅ | ✅ | `ingest.py:97` |
+| Ingest | Size cap, configurable, default 50 MB | ⚠️ | ✅ | `config.py:MAX_UPLOAD_BYTES` |
+| Ingest | Cap enforced before body is buffered | ❌ | ✅ | `main.py` `_reject_oversized_bodies` |
+| Ingest | Infer numeric/categorical/datetime/ID-like/constant | ⚠️ | ✅ | `glassbox.py` `_classify`, `screening.py` |
+| Profile | Per-column missing %, cardinality | ⚠️ | ✅ | `services/profile.py` |
+| Profile | IQR outliers per column | ❌ | ✅ | `profile.py` `outlier_summary` |
+| Profile | Duplicate rows | ✅ | ✅ | `ingest.py` |
+| Profile | High-corr pairs \|r\|>0.9 | ❌ | ✅ | `screening.py` `correlated_pairs` |
+| Profile | Class imbalance | ⚠️ | ✅ | `target.py` `class_balance` |
+| Profile | Health score 0–100, documented weighted formula | ⚠️ | ✅ | `config.py:HEALTH_WEIGHTS`, README |
+| Task | binary / multiclass / regression | ⚠️ | ✅ | `target.py` `describe_task` |
+| Prep | Split 80/20 first, stratified | ✅ | ✅ | `glassbox.py` `fit_preprocessing` |
+| Prep | Fit on train only, transform both | ✅ | ✅ | `glassbox.py`, `tests/test_leakage.py` |
+| Prep | Routing decided from train only | ⚠️ | ✅ | `fit_preprocessing` steps 2–3 |
+| Prep | sklearn Pipeline / ColumnTransformer | ✅ | ✅ | `glassbox.py` `build_pipeline` |
+| Prep | Persist fitted pipeline (joblib) | ❌ | ✅ | `main.py` `_persist_run_artifacts` |
+| Prep | Impute median (num) / mode (cat) | ✅ | ✅ | `glassbox.py` `_block` |
+| Prep | Binary → label encode | ✅ | ✅ | `glassbox.py` `_encoder_spec` |
+| Prep | Low-card (≤10, configurable) → one-hot, `handle_unknown="ignore"` | ⚠️ | ✅ | `config.py:ONEHOT_MAX_CARDINALITY` |
+| Prep | High-card → cross-fitted TargetEncoder | ⚠️ | ✅ | `glassbox.py:HIGH_CARD_ENCODERS` |
+| Prep | Scale: Standard default, MinMax/Robust selectable | ⚠️ | ✅ | `glassbox.py:SCALERS` |
+| Prep | Datetime → y/m/dow/hour + sin/cos | ❌ | ✅ | `glassbox.py` `DatetimeFeatures` |
+| Prep | Leakage flag \|r\|>0.99 with target | ❌ | ✅ | `screening.py` `target_leakage_screen` |
+| Prep | Drop constant + ID-like with logged reason | ✅ | ✅ | `glassbox.py` `build_plan` |
+| Log | JSON record per step | ⚠️ | ✅ | `glassbox.py` `introspect` |
+| API | `POST /datasets` | ❌ | ✅ | `main.py` `create_dataset` |
+| API | `GET /datasets/{id}` | ❌ | ✅ | `main.py` `get_dataset` |
+| API | `GET /datasets/{id}/profile` | ❌ | ✅ | `main.py` `get_profile` |
+| API | `POST /datasets/{id}/preprocess` (target, scaler, options) | ❌ | ✅ | `main.py` `preprocess_dataset` |
+| API | `GET /datasets/{id}/preprocess/log` | ❌ | ✅ | `main.py` `get_preprocess_log` |
+| API | Pydantic schemas | ❌ | ✅ | `app/schemas.py` |
+| API | Correct 4xx errors | ✅ | ✅ | `main.py`, `tests/test_api.py` |
+| DB | SQLAlchemy 2.x + Alembic on SQLite | ❌ | ✅ | `app/db.py`, `migrations/` |
+| DB | `datasets`, `profiles`, `preprocessing_runs`, `preprocessing_logs` | ❌ | ✅ | `app/db.py` |
+| DB | `project_id` + `created_at` on every table | ❌ | ✅ | `db.py` `TimestampedProjectMixin` |
+| Storage | `StorageBackend` interface + `LocalStorage` | ❌ | ✅ | `app/storage.py` |
+| UI | Upload page | ✅ | ✅ | `Upload.tsx` |
+| UI | Profile dashboard: health score | ✅ | ✅ | `Results.tsx`, `HealthBreakdown` |
+| UI | Profile dashboard: per-column flag table | ❌ | ✅ | `ColumnTable.tsx` |
+| UI | Glass-box log, card per step, reason + before→after | ✅ | ✅ | `StepCard.tsx`, `TransformStrip.tsx` |
+| Config | All thresholds in one module | ❌ | ✅ | `app/config.py` |
+| Tests | One per preprocessing rule | ✅ | ✅ | `tests/test_rules.py` |
+| Tests | Leakage: test-split stats never reach fit | ✅ | ✅ | `tests/test_leakage.py` |
+| Tests | API happy path + bad file | ✅ | ✅ | `tests/test_api.py` |
+| Tests | `tests/fixtures` dataset | ❌ | ✅ | `tests/fixtures/titanic.csv` |
 
-## Bugs
+## Bugs found and fixed
 
-1. **`describe_task` mislabels categorical targets** — `target.py:165`. A text target
-   with 21–50 distinct values falls through to `"regression"` (verified: 30 string
-   categories → `regression`). It then reaches `fit_preprocessing` as
-   `task_type="regression"`, which **disables stratification** on what is really a
-   multiclass problem, and the UI shows the wrong task.
-2. **Upload size cap applied after buffering** — `main.py:261`. See leakage/security below.
-3. **`Content-Disposition` built from the raw client filename** — `main.py:300`.
-   `Path(name).stem` strips directories but keeps `"` and control characters.
-4. **`_RUNS` holds 20 full DataFrames plus fitted pipelines** — `main.py:48`. With the
-   cap at its configured maximum this is an unbounded-in-practice memory ceiling, and
-   `MAX_RUNS` evicts by insertion order, not by age or size.
-5. **Exported loader drifts from the real ingest** — `ingest.py:441`. The generated
-   `load_frame()` strips header whitespace but does not reproduce the unnamed-column
-   renaming or duplicate-header disambiguation `_tidy_headers` performs, so an export
-   from a file with duplicate headers will not reproduce the analysed frame.
+1. **`describe_task` mislabelled categorical targets** — a text target with 21–50
+   distinct values returned `"regression"`, which **disabled stratification** on real
+   multiclass problems. Only numeric columns can be regressions now.
+   *Fixed in `target.py`; covered by a parametrised test including the exact case.*
+2. **Upload size cap applied after buffering** — `await file.read()` materialised the
+   whole body before the check. Now refused from `Content-Length` in middleware, with a
+   streaming cap as backstop. *Verified: a 51 MB POST returns 413.*
+3. **`Content-Disposition` built from the raw client filename** — quotes and CRLF
+   survived `Path(name).stem`. Now sanitised to a known-good character set.
+   *Covered by a test that uploads `evil";\r\nX-Injected: yes.csv` and asserts no
+   injected header.*
+4. **`_RUNS` held 20 full DataFrames** as the only copy of a run. Now a cache in front
+   of the database and storage; a miss reads back the stored artefacts.
+5. **Exported loader drifted from the real ingest** — still true for duplicate-header
+   disambiguation; see *Known limitations* below.
+6. **A boolean column crashed the entire run** — found while writing the new tests, not
+   during the audit. `SimpleImputer` rejects `bool` dtype, so any file with a real
+   `True`/`False` column failed with a dtype error. *Fixed by `CategoricalCast`, which
+   also handles pandas nullable extension dtypes.*
+7. **Dates were never parsed from uploads** — found during end-to-end verification. A
+   CSV carries no dtypes, so the datetime feature work was unreachable from the actual
+   upload path and date columns were one-hot encoded into a column per timestamp.
+   *Fixed in `ingest.py`, gated on a four-digit year so version numbers and scores are
+   not turned into 1970 timestamps.*
+8. **Unreachable branch in the identifier screen** — required `unique_rate == 1.0`,
+   which the preceding `>= 0.98` branch always caught first. *Removed.*
 
-## Leakage risks
+## Leakage risks — resolved
 
-1. **Routing decisions read the full frame** — `glassbox.py:846`. `profile_frame(X)` and
-   `find_identifier_columns(frame)` run before the split. Cardinality, missing rate and
-   uniqueness therefore include test rows, so which columns are dropped and whether a
-   column is one-hot or frequency encoded is a function of held-out data. No *fitted
-   parameter* leaks — the module's central claim holds — but the spec's ordering
-   ("split FIRST → fit on train only") is violated at the decision layer. This is the
-   single most important fix in the audit.
-2. **No target-correlation leakage screen** — the spec's `|r|>0.99` flag is absent, so a
-   column that is a copy of the target sails through as an ordinary feature.
-3. Not a risk: `FrequencyEncoder` never reads `y`, and the split-before-fit invariant is
-   genuinely enforced and genuinely tested.
+1. **Routing decisions read the full frame.** `profile_frame` and the identifier screen
+   ran before the split, so cardinality, missing rate and uniqueness included held-out
+   rows, and which columns survived was a function of test data. **Fixed**:
+   `fit_preprocessing` now splits first, and screens are injected callables run on the
+   training fold.
 
-## Upload security
+   Verified to be a real behavioural change, not a cosmetic one: under the old ordering,
+   tampering with only the held-out rows flipped a column from one-hot to
+   high-cardinality encoding. Under the new ordering the plan is byte-identical.
+   `tests/test_leakage.py` asserts exactly this.
+2. **No target-correlation leakage screen.** **Fixed**: `target_leakage_screen` flags any
+   feature correlating above `LEAKAGE_CORRELATION` with the target. It flags and never
+   drops — the spec's word, and the right one, since only the person who exported the
+   file knows whether the column is a mistake or the point.
+3. `TargetEncoder` was added, which does read `y`. A spy test asserts it never sees a
+   held-out label, and its cross-fitting is verified by checking a training row's encoded
+   value is *not* the mean of its own category.
 
-1. **Unbounded read before the cap** — `main.py:261`. `await file.read()` materialises
-   the entire upload in memory, and Starlette has already spooled it to a temp file
-   with no limit. A multi-GB POST exhausts RAM or disk before the 25 MB check runs.
-2. **Header injection via filename** — `main.py:300`, as above.
-3. **No declared content-type check** — extension is validated inside `ingest.py:292`,
-   which is the right gate, but it happens after the bytes are read.
-4. **XLSX parsed with default openpyxl settings** — `ingest.py:284`. Low risk (openpyxl
-   does not resolve external entities), but a decompression-bomb `.xlsx` is unbounded.
-5. Not an issue: CORS is pinned to localhost origins (`main.py:59`), and there is no
-   path taken from user input to the filesystem.
+## Upload security — resolved
 
-## Dead code
+1. **Unbounded read before the cap** — fixed, see Bugs 2.
+2. **Header injection via filename** — fixed, see Bugs 3.
+3. **No declared content-type check** — extension validation in `ingest.py` remains the
+   gate, but it now runs after a bounded read rather than an unbounded one.
+4. **Storage path traversal** — new surface, closed on arrival: `storage.py` validates
+   every key segment, so a key built from a user filename cannot escape the root.
+5. **XLSX decompression bombs** — still unbounded; see *Known limitations*.
 
-- `backend/dropout_pipeline.py` — a generated export committed by accident. Hardcodes
-  `/Users/rohit/Downloads/student_dropout_dataset_v3.csv`. Referenced by nothing.
-- `backend/sample_data/student_dropout_sample.csv` — referenced by nothing; the live
-  sample is `backend/app/sample/campus_records.csv`.
-- `frontend/src/assets/hero.png`, `react.svg`, `vite.svg` — referenced by nothing.
-- `glassbox._main` CLI (`glassbox.py:1136`) — not dead, but undocumented in the README.
+## Dead code — removed
 
-## Status
+- `backend/dropout_pipeline.py` — a generated export hardcoding a path in `~/Downloads`.
+- `backend/sample_data/student_dropout_sample.csv` — superseded by `app/sample/`.
+- `frontend/src/assets/` — `hero.png`, `react.svg`, `vite.svg`, referenced by nothing.
+- The unreachable identifier-screen branch (Bugs 8).
 
-Phase 1 is roughly **60% complete by spec item**, and the 60% that exists is the hard
-60%: the split-before-fit invariant, the derived-not-narrated log, and the explanation
-layer are all well built and well tested. What is missing is the persistence half of
-the spec (DB, storage, pipeline persistence, resource-shaped API) and four profiling
-signals (outliers, correlation pairs, target-leakage flag, imbalance), plus the
-configurability the spec asks for (scaler choice, thresholds in one module).
+## Known limitations
+
+Deliberately not fixed, and why.
+
+- **The exported script does not reproduce header disambiguation.** `_tidy_headers`
+  renames unnamed and duplicate columns; the generated `load_frame()` only strips
+  whitespace. An export from a file with duplicate headers will not reproduce the
+  analysed frame. Narrow enough to be worth stating rather than papering over.
+- **XLSX parsing is unbounded.** A decompression-bomb `.xlsx` within the 50 MB cap can
+  still expand arbitrarily in memory. Fixing it means either bounding openpyxl or
+  pre-scanning the archive, both of which are more machinery than a localhost demo
+  warrants.
+- **Ambiguous dates are read month-first.** `05/01/2024` is May 1st, not 1 May. There is
+  no way to infer the intent from the file, and asking would be a UI this phase does not
+  have.
+- **No accounts.** `project_id` is always `"default"`.
+
+## Verification
+
+Run on 2026-09-20 from a clean state — database deleted, storage deleted, migrations
+applied from zero.
+
+| Check | Result |
+|---|---|
+| `alembic upgrade head` on an empty database | 4 tables, each with `project_id` + `created_at` |
+| `pytest tests/ -q` | 137 passed |
+| `uvicorn app.main:app` | starts, `/api/health` responds |
+| `npm run build` | builds clean |
+| `npm run lint` | clean |
+| End-to-end on `tests/fixtures/titanic.csv` over HTTP | upload → profile → preprocess → log → downloads, all 200 |
+| Exported script | compiles and runs standalone, both encoders |
+| Cold-start restart | joblib pipeline reloads and transforms all 891 rows |
+| UI | verified in a browser at desktop and 375px widths |
+
+End-to-end result on the fixture: 891 rows, health 86, target `Survived` detected as
+binary classification, 712/179 split, 22 features, `PassengerId`/`Ticket`/`Name`/`Cabin`
+set aside with reasons, 7 step cards including the datetime derivation.

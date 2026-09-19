@@ -410,3 +410,49 @@ def test_a_date_column_in_an_uploaded_csv_becomes_calendar_features() -> None:
     result = fit_preprocessing(ingested.frame, "label", "classification")
     assert result.plan.datetime == ["signed_up"]
     assert "signed_up_month_sin" in result.X_train.columns
+
+
+def test_the_exported_script_reproduces_the_apps_split_exactly() -> None:
+    """The script's whole claim. An off-by-one row makes it false.
+
+    ``test_size`` must be the value the run used, not one derived back from the row
+    counts: 179/891 rounds to 0.2009, and sklearn's ceiling on that is 180 rows, not
+    the 179 the app actually held out.
+    """
+    import re
+    import subprocess
+    import sys
+    import tempfile
+    from pathlib import Path
+
+    from app.services.glassbox import export_script
+
+    rng = np.random.default_rng(1912)
+    n = 891  # a row count where the rounding bites
+    df = pd.DataFrame({
+        "amount": rng.normal(100, 15, n),
+        "tier": rng.choice(["a", "b", "c"], n),
+        "label": rng.choice([0, 1], n),
+    })
+
+    result = fit_preprocessing(df, "label", "classification", test_size=0.2)
+
+    workspace = Path(tempfile.mkdtemp())
+    csv = workspace / "data.csv"
+    df.to_csv(csv, index=False)
+
+    source = export_script(result, csv=str(csv), exp_id="t", seed=result.seed)
+    script = workspace / "prep.py"
+    script.write_text(source)
+
+    run = subprocess.run([sys.executable, str(script)], capture_output=True, text=True)
+    assert run.returncode == 0, run.stderr
+
+    shapes = re.search(r"train: \((\d+), (\d+)\)\s+test: \((\d+), (\d+)\)", run.stdout)
+    assert shapes, run.stdout
+    train_rows, train_cols, test_rows, test_cols = (int(g) for g in shapes.groups())
+
+    assert train_rows == len(result.X_train)
+    assert test_rows == len(result.X_test)
+    assert train_cols == result.X_train.shape[1]
+    assert test_cols == result.X_test.shape[1]

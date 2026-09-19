@@ -929,7 +929,7 @@ async def download_script(run_id: str, session: Session = Depends(get_session)) 
         cached.result,
         csv=cached.filename,
         exp_id=run_id[:8],
-        seed=run.seed,
+        seed=cached.result.seed,
         loader_block=block,
         loader_call=call,
     )
