@@ -1,0 +1,84 @@
+@import "tailwindcss";
+
+/* ---------------------------------------------------------------------------
+   ML-BenchX design tokens
+
+   The subject is data being examined under light, so the surface is a cool
+   near-white and the structure is drawn in grey. Six colours, all named:
+
+     bone    the working surface the data sits on
+     paper   raised surfaces — cards, the strip
+     ink     text
+     slate   structure: rules, labels, secondary text
+     xray    the one saturated accent. Reserved for TWO things only:
+             a value that changed, and the active/focused control. If it
+             appears anywhere else the highlight stops meaning anything.
+     ochre   the single warm tone, reserved for warnings
+
+   Type does real work here. Monospace is not decoration: it marks the
+   boundary between the user's data and our words about it, so every column
+   name, every value and every number is set in it.
+--------------------------------------------------------------------------- */
+
+@theme {
+  --color-bone: #f2f5f7;
+  --color-paper: #ffffff;
+  --color-ink: #11161c;
+  --color-slate: #64748b;
+  --color-xray: #0097b2;
+  --color-ochre: #a8620d;
+
+  --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
+  --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
+
+  --text-base: 1rem;
+  --text-lg: 1.0625rem;
+}
+
+html {
+  background: var(--color-bone);
+  -webkit-font-smoothing: antialiased;
+}
+
+body {
+  font-family: var(--font-sans);
+  color: var(--color-ink);
+  font-size: 1rem;
+  line-height: 1.6;
+}
+
+/* Focus must always be visible — the demo is partly keyboard-driven. */
+:focus-visible {
+  outline: 2px solid var(--color-xray);
+  outline-offset: 2px;
+  border-radius: 2px;
+}
+
+/* Cards arrive on a short stagger, once, on first load. */
+@keyframes rise {
+  from {
+    opacity: 0;
+    transform: translateY(10px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+.rise {
+  animation: rise 380ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .rise {
+    animation: none;
+  }
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.001ms !important;
+    transition-duration: 0.001ms !important;
+  }
+}
