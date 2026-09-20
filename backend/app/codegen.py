@@ -59,17 +59,8 @@ import sys
 
 import numpy as np
 import pandas as pd
-from sklearn.impute import SimpleImputer
 from sklearn.model_selection import train_test_split
-from sklearn.preprocessing import (
-    MinMaxScaler,
-    OneHotEncoder,
-    OrdinalEncoder,
-    RobustScaler,
-    StandardScaler,
-    TargetEncoder,
-)
-
+{sklearn_imports}
 # Paths are supplied by the runner; the defaults let the script stand alone.
 INPUT_PATH = os.environ.get("MLBX_INPUT", "input.csv")
 OUTPUT_PATH = os.environ.get("MLBX_OUTPUT", "processed.csv")
@@ -612,6 +603,52 @@ def _scaler_class(method: str) -> str:
     ]
 
 
+def _sklearn_imports(config: PipelineConfig) -> str:
+    """Import only what this configuration actually uses.
+
+    A generated file is meant to be read. Importing six transformers when the pipeline
+    uses one makes the reader wonder which of them matter, and makes "this step is
+    switched off" less than completely true — the name would still be there in the
+    imports.
+    """
+    impute: list[str] = []
+    preprocessing: list[str] = []
+
+    if config.missing_values.enabled and config.missing_values.numeric_strategy in (
+        "median", "mean", "constant",
+    ):
+        impute.append("SimpleImputer")
+    if config.missing_values.enabled and config.missing_values.categorical_strategy in (
+        "most_frequent", "constant",
+    ):
+        impute.append("SimpleImputer")
+
+    if config.encoding.enabled:
+        methods = {
+            config.encoding.binary_method,
+            config.encoding.low_cardinality_method,
+            config.encoding.high_cardinality_method,
+        }
+        if "onehot" in methods:
+            preprocessing.append("OneHotEncoder")
+        if methods & {"label", "ordinal"}:
+            preprocessing.append("OrdinalEncoder")
+        if "target" in methods:
+            preprocessing.append("TargetEncoder")
+
+    if config.scaling.enabled:
+        preprocessing.append(_scaler_class(config.scaling.method))
+
+    lines: list[str] = []
+    if impute:
+        lines.append(f"from sklearn.impute import {', '.join(sorted(set(impute)))}")
+    if preprocessing:
+        lines.append(
+            f"from sklearn.preprocessing import {', '.join(sorted(set(preprocessing)))}"
+        )
+    return "\n".join(lines) + ("\n" if lines else "")
+
+
 def generate(config: PipelineConfig) -> str:
     """Emit the complete Python program for one pipeline configuration.
 
@@ -620,7 +657,11 @@ def generate(config: PipelineConfig) -> str:
     """
     parts: list[str] = [
         _PREAMBLE.format(
-            target=config.target, test_size=config.test_size, seed=config.seed
+            target=config.target,
+            test_size=config.test_size,
+            seed=config.seed,
+            sklearn_imports=_sklearn_imports(config),
+            extra_imports="",
         )
     ]
 
