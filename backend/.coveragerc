@@ -1,0 +1,24 @@
+# Coverage is measured over `app/` only.
+#
+# The generated pipeline script is excluded: it never runs in this process — it is
+# written to a file and executed inside the sandbox — so coverage cannot see it, and
+# counting it would report 0% for code that `test_codegen.py` exercises thoroughly by
+# running it.
+
+[run]
+source = app
+branch = True
+omit =
+    app/__init__.py
+    */migrations/*
+
+[report]
+precision = 1
+show_missing = True
+skip_covered = True
+exclude_lines =
+    pragma: no cover
+    if TYPE_CHECKING:
+    raise NotImplementedError
+    if __name__ == .__main__.:
+    \.\.\.

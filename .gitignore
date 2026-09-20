@@ -9,3 +9,10 @@ frontend/dist/
 # Local database and stored uploads/pipelines
 backend/mlbenchx.db
 backend/storage/
+
+# Generated on demand by backend/tests/fixtures/generate.py — ~10 MB
+backend/tests/fixtures/perf_10mb.csv
+
+# Coverage output
+backend/htmlcov/
+backend/.coverage

@@ -1,0 +1,33 @@
+# Runtime dependencies, pinned exactly.
+#
+# Exact pins rather than ranges: this application's correctness claims are about
+# numerical behaviour — a scaler's centre, an encoder's cross-fitting, a quantile — and
+# a minor release of pandas or scikit-learn can move those without any code changing.
+# A pipeline that produced one dataset yesterday and a different one today, with the
+# same input and the same seed, would falsify the determinism guarantee in §6.
+#
+# Install:  pip install -r requirements.txt
+
+# --- data and modelling ---------------------------------------------------------------
+pandas==2.3.3
+numpy==2.4.1
+scikit-learn==1.8.0
+scipy==1.17.0            # KS drift test (spec §4d)
+joblib==1.5.3            # fitted-pipeline artifact (spec §6)
+pyarrow==23.0.1          # parquet artifacts (spec §6) and parquet ingestion (§1)
+openpyxl==3.1.5          # xlsx ingestion (§1)
+charset-normalizer==3.4.6  # encoding fallback (§1)
+
+# --- web ------------------------------------------------------------------------------
+fastapi==0.141.1
+starlette==1.5.0
+uvicorn==0.52.1
+pydantic==2.13.4
+python-multipart==0.0.32   # multipart upload parsing
+
+# --- persistence ----------------------------------------------------------------------
+SQLAlchemy==2.0.54
+alembic==1.20.0
+
+# --- process isolation ----------------------------------------------------------------
+psutil==7.2.1            # memory watchdog; macOS refuses to lower RLIMIT_AS
