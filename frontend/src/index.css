@@ -1,65 +1,131 @@
 @import "tailwindcss";
 
 /* ---------------------------------------------------------------------------
-   ML-BenchX design tokens
+   ML-BenchX design tokens — dark-first.
 
-   The subject is data being examined under light, so the surface is a cool
-   near-white and the structure is drawn in grey. Six colours, all named:
+   The product is an instrument panel for looking at data, and it is read for
+   long stretches at a time. So the surface recedes and the data comes forward:
+   a near-black ground, structure drawn in a cool grey, and exactly one
+   saturated accent.
 
-     bone    the working surface the data sits on
-     paper   raised surfaces — cards, the strip
-     ink     text
-     slate   structure: rules, labels, secondary text
-     xray    the one saturated accent. Reserved for TWO things only:
-             a value that changed, and the active/focused control. If it
-             appears anywhere else the highlight stops meaning anything.
-     ochre   the single warm tone, reserved for warnings
+   Surfaces, from back to front:
 
-   Type does real work here. Monospace is not decoration: it marks the
-   boundary between the user's data and our words about it, so every column
-   name, every value and every number is set in it.
+     void     the page ground, near-black
+     surface  panels — the three columns of the workspace
+     raised   cards sitting on a panel
+     sunken   wells: the editor, the table, log output
+
+   Ink:
+
+     text     primary
+     muted    secondary — labels, descriptions, units
+     faint    tertiary — disabled, placeholder, rules
+
+   Meaning:
+
+     accent   the one saturated colour. Reserved for THREE things: a value
+              that changed, the active control, and the compile action. If it
+              appears anywhere else it stops meaning anything.
+     warn     something the user should look at before continuing
+     danger   something that will break, or has
+     good     a check that passed
+
+   Type does real work. Monospace is not decoration: it marks the boundary
+   between the user's data and our words about it, so every column name, value
+   and measured number is set in it, and every sentence we write is not.
 --------------------------------------------------------------------------- */
 
 @theme {
-  --color-bone: #f2f5f7;
-  --color-paper: #ffffff;
-  --color-ink: #11161c;
-  --color-slate: #64748b;
-  --color-xray: #0097b2;
-  --color-ochre: #a8620d;
+  --color-void: #08090c;
+  --color-surface: #0e1014;
+  --color-raised: #14171d;
+  --color-sunken: #0a0c0f;
+
+  --color-line: #1f242e;
+  --color-line-strong: #2b323f;
+
+  --color-text: #e8ecf2;
+  --color-muted: #8b93a3;
+  --color-faint: #565e6e;
+
+  --color-accent: #3dd6c4;
+  --color-accent-dim: #1d7a70;
+  --color-warn: #e0a33c;
+  --color-danger: #e2685f;
+  --color-good: #4ba97a;
+  --color-info: #6f8fd6;
 
   --font-display: "Space Grotesk", ui-sans-serif, system-ui, sans-serif;
   --font-sans: "IBM Plex Sans", ui-sans-serif, system-ui, sans-serif;
   --font-mono: "IBM Plex Mono", ui-monospace, "SF Mono", monospace;
 
-  --text-base: 1rem;
-  --text-lg: 1.0625rem;
+  --radius-panel: 14px;
+  --radius-card: 10px;
 }
 
 html {
-  background: var(--color-bone);
+  background: var(--color-void);
+  color-scheme: dark;
   -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
 }
 
 body {
   font-family: var(--font-sans);
-  color: var(--color-ink);
-  font-size: 1rem;
+  color: var(--color-text);
+  font-size: 15px;
   line-height: 1.6;
+  margin: 0;
 }
 
-/* Focus must always be visible — the demo is partly keyboard-driven. */
+/* Focus must always be visible: the workspace is substantially keyboard-driven,
+   and a focus ring that only some components draw is worse than none. */
 :focus-visible {
-  outline: 2px solid var(--color-xray);
+  outline: 2px solid var(--color-accent);
   outline-offset: 2px;
-  border-radius: 2px;
+  border-radius: 3px;
 }
 
-/* Cards arrive on a short stagger, once, on first load. */
+::selection {
+  background: color-mix(in oklab, var(--color-accent) 30%, transparent);
+  color: var(--color-text);
+}
+
+/* Scrollbars. The default light ones cut holes in a dark panel. */
+* {
+  scrollbar-width: thin;
+  scrollbar-color: var(--color-line-strong) transparent;
+}
+*::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+*::-webkit-scrollbar-track {
+  background: transparent;
+}
+*::-webkit-scrollbar-thumb {
+  background: var(--color-line-strong);
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+*::-webkit-scrollbar-thumb:hover {
+  background: var(--color-faint);
+  background-clip: content-box;
+}
+
+/* ---------------------------------------------------------------------------
+   Motion.
+
+   Every animation here reports a state change: something arrived, something
+   is working, something succeeded or failed. None of it is ornament, and all
+   of it is short enough not to sit between the user and their next action.
+--------------------------------------------------------------------------- */
+
 @keyframes rise {
   from {
     opacity: 0;
-    transform: translateY(10px);
+    transform: translateY(8px);
   }
   to {
     opacity: 1;
@@ -67,18 +133,184 @@ body {
   }
 }
 
+@keyframes fade {
+  from {
+    opacity: 0;
+  }
+  to {
+    opacity: 1;
+  }
+}
+
+@keyframes pulse-soft {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
+  }
+}
+
+@keyframes shake {
+  0%,
+  100% {
+    transform: translateX(0);
+  }
+  20% {
+    transform: translateX(-5px);
+  }
+  40% {
+    transform: translateX(5px);
+  }
+  60% {
+    transform: translateX(-3px);
+  }
+  80% {
+    transform: translateX(3px);
+  }
+}
+
+@keyframes sweep {
+  from {
+    transform: translateX(-100%);
+  }
+  to {
+    transform: translateX(300%);
+  }
+}
+
+@keyframes flow {
+  from {
+    stroke-dashoffset: 24;
+  }
+  to {
+    stroke-dashoffset: 0;
+  }
+}
+
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+
 .rise {
-  animation: rise 380ms cubic-bezier(0.2, 0.7, 0.3, 1) both;
+  animation: rise 0.34s cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.fade {
+  animation: fade 0.24s ease-out both;
+}
+.shake {
+  animation: shake 0.4s ease-in-out;
+}
+.spin {
+  animation: spin 0.9s linear infinite;
+}
+.pulse-soft {
+  animation: pulse-soft 1.6s ease-in-out infinite;
+}
+
+/* The moving highlight on a progress bar of indeterminate length. */
+.sweep::after {
+  content: "";
+  position: absolute;
+  inset-block: 0;
+  width: 33%;
+  background: linear-gradient(
+    90deg,
+    transparent,
+    color-mix(in oklab, var(--color-accent) 55%, transparent),
+    transparent
+  );
+  animation: sweep 1.3s ease-in-out infinite;
+}
+
+/* Data flowing along a pipeline edge. */
+.flow {
+  stroke-dasharray: 4 8;
+  animation: flow 1s linear infinite;
 }
 
 @media (prefers-reduced-motion: reduce) {
-  .rise {
-    animation: none;
-  }
   *,
   *::before,
   *::after {
-    animation-duration: 0.001ms !important;
-    transition-duration: 0.001ms !important;
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
   }
+}
+
+/* ---------------------------------------------------------------------------
+   Primitives used in enough places to be worth naming.
+--------------------------------------------------------------------------- */
+
+/* A panel: the three columns of the workspace, and the cards on the landing
+   page. Border rather than shadow — on a near-black ground a shadow reads as
+   a smudge, while a one-pixel line reads as an edge. */
+.panel {
+  background: var(--color-surface);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-panel);
+}
+
+.card {
+  background: var(--color-raised);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-card);
+}
+
+.well {
+  background: var(--color-sunken);
+  border: 1px solid var(--color-line);
+  border-radius: var(--radius-card);
+}
+
+/* Used behind the hero and the final call to action. Two very low-opacity
+   radial washes: enough to stop a large dark area reading as flat, faint
+   enough that no one should consciously notice it. */
+.aurora {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background:
+    radial-gradient(
+      60rem 30rem at 15% -10%,
+      color-mix(in oklab, var(--color-accent) 9%, transparent),
+      transparent 70%
+    ),
+    radial-gradient(
+      50rem 28rem at 90% 0%,
+      color-mix(in oklab, var(--color-info) 8%, transparent),
+      transparent 70%
+    );
+}
+
+/* The faint grid behind the hero — a nod to a spreadsheet, at the threshold
+   of visibility. */
+.grid-veil {
+  position: absolute;
+  inset: 0;
+  pointer-events: none;
+  background-image:
+    linear-gradient(var(--color-line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--color-line) 1px, transparent 1px);
+  background-size: 56px 56px;
+  mask-image: radial-gradient(70% 55% at 50% 30%, #000 20%, transparent 75%);
+  opacity: 0.35;
+}
+
+/* Numbers that change in place — a health score, a row count — must not make
+   the layout jump as digits change width. */
+.tnum {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Monaco paints its own background; this keeps it flush with our well. */
+.monaco-host .monaco-editor,
+.monaco-host .monaco-editor .overflow-guard,
+.monaco-host .monaco-editor-background,
+.monaco-host .monaco-editor .margin {
+  background: var(--color-sunken) !important;
 }
