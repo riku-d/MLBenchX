@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import csv
 import io
+import json
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -45,6 +46,8 @@ __all__ = [
 
 _SPREADSHEET_SUFFIXES = (".xlsx", ".xls", ".xlsm")
 _TEXT_SUFFIXES = (".csv", ".tsv", ".txt")
+_JSON_SUFFIXES = (".json", ".jsonl", ".ndjson")
+_PARQUET_SUFFIXES = (".parquet", ".pq")
 
 #: Currency symbols, thousands separators and stray percent signs that stop pandas from
 #: seeing a number. Stripped only when doing so makes the whole column numeric.
@@ -368,9 +371,84 @@ def _score_quality(
 # --------------------------------------------------------------------------------------
 
 
+def _read_json(raw: bytes, filename: str) -> pd.DataFrame:
+    """Read a JSON dataset, accepting the three shapes people actually export.
+
+    A list of objects is the common one. Line-delimited JSON is what streaming tools
+    emit. A dict of columns is what ``DataFrame.to_json()`` produces by default, and a
+    user who round-tripped their own data through pandas should not be told their file
+    is unreadable.
+
+    Nested objects are left as they are rather than flattened: a column of dicts
+    profiles as free text and is reported as such, which is a truthful description of a
+    file that is not really tabular.
+    """
+    text = raw.decode("utf-8", errors="replace").strip()
+    if not text:
+        raise IngestError("That file is empty. Upload one with some rows in it.")
+
+    lowered = filename.lower()
+    if lowered.endswith((".jsonl", ".ndjson")) or (text[0] == "{" and "\n{" in text):
+        try:
+            return pd.read_json(io.StringIO(text), lines=True)
+        except ValueError as exc:
+            raise IngestError(
+                "We couldn't read that file as line-delimited JSON. Check that each "
+                "line is a complete JSON object."
+            ) from exc
+
+    try:
+        parsed = json.loads(text)
+    except json.JSONDecodeError as exc:
+        raise IngestError(
+            f"That file isn't valid JSON — {exc.msg} at line {exc.lineno}."
+        ) from exc
+
+    if isinstance(parsed, list):
+        frame = pd.json_normalize(parsed, max_level=1)
+    elif isinstance(parsed, dict):
+        # Either {column: {index: value}} from to_json(), or a wrapper around the rows.
+        rows = next(
+            (v for v in parsed.values() if isinstance(v, list) and v and isinstance(v[0], dict)),
+            None,
+        )
+        frame = pd.json_normalize(rows, max_level=1) if rows is not None else pd.DataFrame(parsed)
+    else:
+        raise IngestError(
+            "That JSON file holds a single value rather than a table. We need a list of "
+            "records, or one object per line."
+        )
+
+    if frame.empty:
+        raise IngestError("That JSON file has no rows in it.")
+    return frame
+
+
+def _read_parquet(raw: bytes) -> pd.DataFrame:
+    """Read a Parquet file. Columnar and typed, so nothing has to be inferred."""
+    try:
+        return pd.read_parquet(io.BytesIO(raw))
+    except ImportError as exc:  # pragma: no cover - depends on the install
+        raise IngestError(
+            "Reading Parquet needs the pyarrow package, which is not installed here. "
+            "Export your data as CSV instead."
+        ) from exc
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user as a sentence
+        raise IngestError(
+            "We couldn't open that Parquet file. It may be truncated, or written with "
+            "a feature this reader does not support — try exporting it as CSV."
+        ) from exc
+
+
 def _read_frame(raw: bytes, filename: str) -> tuple[pd.DataFrame, str, str]:
     """Parse the bytes into a frame, returning it with the detected encoding/delimiter."""
     lowered = filename.lower()
+
+    if lowered.endswith(_PARQUET_SUFFIXES):
+        return _read_parquet(raw), "n/a (parquet)", "n/a (parquet)"
+
+    if lowered.endswith(_JSON_SUFFIXES):
+        return _read_json(raw, filename), "utf-8", "n/a (json)"
 
     if lowered.endswith(_SPREADSHEET_SUFFIXES):
         try:
@@ -384,8 +462,8 @@ def _read_frame(raw: bytes, filename: str) -> tuple[pd.DataFrame, str, str]:
 
     if not lowered.endswith(_TEXT_SUFFIXES):
         raise IngestError(
-            "We can read CSV, TSV and Excel files. That one has a different extension — "
-            "open it and save a copy as CSV."
+            "We can read CSV, TSV, Excel, JSON and Parquet files. That one has a "
+            "different extension — open it and save a copy as CSV."
         )
 
     encoding = _detect_encoding(raw)

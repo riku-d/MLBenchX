@@ -163,3 +163,107 @@ applied from zero.
 End-to-end result on the fixture: 891 rows, health 86, target `Survived` detected as
 binary classification, 712/179 split, 22 features, `PassengerId`/`Ticket`/`Name`/`Cabin`
 set aside with reasons, 7 step cards including the datetime derivation.
+
+
+---
+
+# Phase 2 — the interactive platform
+
+Built 2026-09-20 on top of the Phase 1 engine. The brief was a full preprocessing
+workspace: a landing page, three-panel IDE, per-step toggles with consequences stated
+before they apply, a code editor whose output actually runs, sandboxed execution, and a
+download centre.
+
+## What was added
+
+| Area | Delivered | Where |
+|---|---|---|
+| Pipeline config | 8 steps, each independently configurable, fixed order | `app/pipeline.py` |
+| Code generation | Config → standalone runnable Python, the only such path | `app/codegen.py` |
+| Sandboxed execution | OS sandbox + rlimits + memory watchdog + timeout | `app/executor.py` |
+| Health engine | Six measured dimensions with evidence and arithmetic | `app/services/health.py` |
+| Impact analysis | Measured consequences of disabling any step | `app/services/impact.py` |
+| Workspace API | 12 routes; every mutation returns the whole workspace | `app/workspace.py` |
+| Persistence | `workspaces`, `compilations`, `history` tables | `app/db.py` |
+| Landing page | Hero with live preview, 8 sections | `frontend/src/landing/` |
+| Workspace UI | 3 panels + resizable dock, Monaco, impact dialog | `frontend/src/workspace/` |
+| Downloads | processed, original, code, config, report, zipped project | `app/workspace.py` |
+
+## Bugs found while building, and fixed
+
+These were found by the tooling doing its job rather than by inspection, which is the
+only reason they are listed as findings rather than as design.
+
+1. **Datetime expansion emitted dead columns.** A single-day date column produced 15
+   derived columns, 13 of them constant. The health engine's uniqueness dimension
+   caught it. Calendar parts that do not vary are now skipped: 26 output columns became
+   16 on the fixture.
+2. **The validity check inferred meaning from column names.** It flagged "Age should
+   not go below zero" on correctly *scaled* data, where half of every column is negative
+   by construction. Removed rather than patched — it was guesswork that misfired on
+   exactly the output this app produces.
+3. **Scale disparity reported 8×10³¹.** A near-constant column's "spread" was rounding
+   error. Columns with no real spread are now excluded from the ratio.
+4. **`RLIMIT_AS` does nothing on macOS.** The `setrlimit` call that appears as a memory
+   cap in most examples is silently refused at any value. Replaced with a watchdog
+   thread that polls the process group's resident size — verified to fire.
+5. **Monaco reset scroll to the top on every server update.** Changing a toggle threw
+   the reader back to line 1 from wherever they were. View state is now saved and
+   restored around the change.
+6. **A stale error marker survived a code edit**, pointing at a line that was no longer
+   the one that failed. The marker is retracted once the code differs from the run that
+   produced it; the log keeps the failure as history.
+7. **The generated file imported six sklearn transformers regardless of use**, so
+   "this step is off" was not completely true — the name remained in the imports. They
+   are now derived from the configuration.
+
+## The security position
+
+The editor means the backend runs user-written Python. Layers, in order of strength:
+an OS sandbox profile denying network and out-of-directory writes; CPU, file-size and
+process-count limits; a memory watchdog; a wall-clock timeout on the process group; a
+scrubbed environment.
+
+`tests/test_executor.py` attacks each of these for real — network, DNS, writes outside
+the work directory, `rmtree` of this repository, a shell-out to `rm` against a canary,
+a fork bomb, a memory bomb, an infinite loop — and asserts afterwards that the
+repository survived.
+
+**Stated limitation.** Without `sandbox-exec` only the process limits apply. The app
+reports which layer is active and the workspace shows it; the production answer is a
+container with no network namespace, and the executor is shaped so swapping one in
+means replacing a single function.
+
+## Verification
+
+Run from a clean state on 2026-09-20 — database deleted, storage deleted, migrations
+applied from zero.
+
+| Check | Result |
+|---|---|
+| `alembic upgrade head` from empty | 8 tables; `project_id` + `created_at` on all |
+| `pytest tests/ -q` | 244 passed |
+| `npm run build` / `npm run lint` | clean |
+| All 37 config permutations | generate code that compiles and runs |
+| Sandbox attacks | all contained; repository intact |
+| Full API flow over HTTP | upload → workspace → impact → compile → 6 downloads, all 200 |
+| Downloaded `pipeline.py` | compiles standalone |
+| Browser: landing, upload, workspace | verified |
+| Browser: toggle → impact dialog → compile | verified with measured 92 → 90 delta |
+| Browser: edit code → compile → error → reset | verified, line 295 diagnosed |
+| Responsive at 375 / 768 / 1440 | no horizontal overflow at any width |
+
+End-to-end on the fixture: 891 rows, health 90 → 92, 13 → 16 columns, compile in
+about 1.0s under the OS sandbox.
+
+## Known limitations
+
+- Compiling is synchronous. Correct at these file sizes; a dataset large enough to need
+  a queue would need streaming ingestion first.
+- The impact preview runs the pipeline to measure the projected score, so it costs
+  about a second. Showing a guessed number instantly was the alternative.
+- Feature selection's mutual-information ranking runs on the training fold only, but
+  `top_k` is applied globally rather than re-measured per fold.
+- Nested JSON is read without flattening. A column of objects profiles as free text and
+  is reported as such, which is a truthful description of a file that is not really
+  tabular, but it is not made useful.

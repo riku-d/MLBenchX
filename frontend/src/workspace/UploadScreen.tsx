@@ -12,7 +12,7 @@ import { AlertCircle, FileSpreadsheet, FolderOpen, Upload as UploadIcon } from "
 import { ApiError, api, type DatasetSummary } from "../api";
 import { Button, Spinner } from "../components/ui";
 
-const ACCEPT = ".csv,.tsv,.txt,.xlsx,.xls,.xlsm,.json,.parquet";
+const ACCEPT = ".csv,.tsv,.txt,.xlsx,.xls,.xlsm,.json,.jsonl,.ndjson,.parquet,.pq";
 
 /** The phases the user is told about while a dataset is being read. */
 const PHASES = [
@@ -166,7 +166,7 @@ export function UploadScreen({
                   Drop a dataset here
                 </span>
                 <span className="mt-1.5 text-[13.5px] text-muted">
-                  or click to browse — CSV, Excel, JSON or Parquet, up to 50 MB
+                  or click to browse — CSV, TSV, Excel, JSON or Parquet, up to 50 MB
                 </span>
               </button>
               <input

@@ -456,3 +456,73 @@ def test_the_exported_script_reproduces_the_apps_split_exactly() -> None:
     assert test_rows == len(result.X_test)
     assert train_cols == result.X_train.shape[1]
     assert test_cols == result.X_test.shape[1]
+
+
+# --------------------------------------------------------------------------------------
+# File formats
+# --------------------------------------------------------------------------------------
+
+
+@pytest.fixture
+def titanic() -> pd.DataFrame:
+    from pathlib import Path
+
+    return pd.read_csv(Path(__file__).parent / "fixtures" / "titanic.csv")
+
+
+def test_json_records_are_read(titanic) -> None:
+    """A list of objects — what most APIs and exports produce."""
+    import json as json_module
+
+    from app.services.ingest import read_upload
+
+    raw = json_module.dumps(titanic.to_dict(orient="records"), default=str).encode()
+    result = read_upload(raw, "records.json")
+    assert result.rows == 891
+    assert result.columns == 13
+
+
+def test_json_columns_are_read(titanic) -> None:
+    """What `DataFrame.to_json()` produces by default, so a round trip must survive."""
+    from app.services.ingest import read_upload
+
+    result = read_upload(titanic.to_json(orient="columns").encode(), "columns.json")
+    assert result.rows == 891
+
+
+def test_line_delimited_json_is_read(titanic) -> None:
+    """What streaming tools emit."""
+    from app.services.ingest import read_upload
+
+    raw = titanic.to_json(orient="records", lines=True).encode()
+    result = read_upload(raw, "events.jsonl")
+    assert result.rows == 891
+
+
+def test_parquet_is_read(titanic) -> None:
+    import io as io_module
+
+    from app.services.ingest import read_upload
+
+    buffer = io_module.BytesIO()
+    titanic.to_parquet(buffer, index=False)
+    result = read_upload(buffer.getvalue(), "data.parquet")
+    assert result.rows == 891
+    assert result.columns == 13
+
+
+@pytest.mark.parametrize(
+    "name,payload,fragment",
+    [
+        ("broken.json", b"{not json", "valid JSON"),
+        ("scalar.json", b"42", "single value"),
+        ("broken.parquet", b"not a parquet file at all", "Parquet"),
+        ("notes.pdf", b"%PDF-1.4", "different extension"),
+    ],
+)
+def test_an_unreadable_file_is_refused_with_a_sentence(name, payload, fragment) -> None:
+    from app.services.ingest import IngestError, read_upload
+
+    with pytest.raises(IngestError) as caught:
+        read_upload(payload, name)
+    assert fragment in str(caught.value)
