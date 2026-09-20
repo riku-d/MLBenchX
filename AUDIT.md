@@ -1,269 +1,225 @@
 # ML-BenchX — Phase 1 audit
 
-Audited 2026-09-19 against the Phase 1 spec, remediated 2026-09-20.
+Audited against [docs/PHASE1_SPEC.md](docs/PHASE1_SPEC.md) on 2026-09-20.
+An earlier audit against a narrower spec is archived in
+[docs/AUDIT_PREVIOUS.md](docs/AUDIT_PREVIOUS.md).
 
-**Final status: every spec item is implemented.** 137 tests pass, the backend starts,
-the frontend builds, and an end-to-end run against `tests/fixtures/titanic.csv`
-completes over HTTP. Work landed in six commits, one per area.
+Baseline: 252 pytest tests pass, frontend lints and builds, migrations run from empty.
 
-Legend: ✅ done · ⚠️ partial · ❌ absent. The **Was** column is the state at audit time;
-**Now** is the state after remediation.
+**Headline.** The engine underneath is strong — the leakage guarantee is *stricter* than
+the spec asks and is genuinely tested. But the spec describes a
+**propose → review → execute** product, and what exists is **configure → run**. The two
+central spec objects — a per-column `PreprocessingPlan` the user edits, and a versioned
+`run` with artifacts — do not exist. That accounts for most of the ❌ below and most of
+the remaining work.
 
-## Spec coverage
-
-| Area | Spec item | Was | Now | Where |
-|---|---|---|---|---|
-| Ingest | CSV/XLSX read | ✅ | ✅ | `ingest.py:278` |
-| Ingest | Encoding check | ✅ | ✅ | `ingest.py:97` |
-| Ingest | Size cap, configurable, default 50 MB | ⚠️ | ✅ | `config.py:MAX_UPLOAD_BYTES` |
-| Ingest | Cap enforced before body is buffered | ❌ | ✅ | `main.py` `_reject_oversized_bodies` |
-| Ingest | Infer numeric/categorical/datetime/ID-like/constant | ⚠️ | ✅ | `glassbox.py` `_classify`, `screening.py` |
-| Profile | Per-column missing %, cardinality | ⚠️ | ✅ | `services/profile.py` |
-| Profile | IQR outliers per column | ❌ | ✅ | `profile.py` `outlier_summary` |
-| Profile | Duplicate rows | ✅ | ✅ | `ingest.py` |
-| Profile | High-corr pairs \|r\|>0.9 | ❌ | ✅ | `screening.py` `correlated_pairs` |
-| Profile | Class imbalance | ⚠️ | ✅ | `target.py` `class_balance` |
-| Profile | Health score 0–100, documented weighted formula | ⚠️ | ✅ | `config.py:HEALTH_WEIGHTS`, README |
-| Task | binary / multiclass / regression | ⚠️ | ✅ | `target.py` `describe_task` |
-| Prep | Split 80/20 first, stratified | ✅ | ✅ | `glassbox.py` `fit_preprocessing` |
-| Prep | Fit on train only, transform both | ✅ | ✅ | `glassbox.py`, `tests/test_leakage.py` |
-| Prep | Routing decided from train only | ⚠️ | ✅ | `fit_preprocessing` steps 2–3 |
-| Prep | sklearn Pipeline / ColumnTransformer | ✅ | ✅ | `glassbox.py` `build_pipeline` |
-| Prep | Persist fitted pipeline (joblib) | ❌ | ✅ | `main.py` `_persist_run_artifacts` |
-| Prep | Impute median (num) / mode (cat) | ✅ | ✅ | `glassbox.py` `_block` |
-| Prep | Binary → label encode | ✅ | ✅ | `glassbox.py` `_encoder_spec` |
-| Prep | Low-card (≤10, configurable) → one-hot, `handle_unknown="ignore"` | ⚠️ | ✅ | `config.py:ONEHOT_MAX_CARDINALITY` |
-| Prep | High-card → cross-fitted TargetEncoder | ⚠️ | ✅ | `glassbox.py:HIGH_CARD_ENCODERS` |
-| Prep | Scale: Standard default, MinMax/Robust selectable | ⚠️ | ✅ | `glassbox.py:SCALERS` |
-| Prep | Datetime → y/m/dow/hour + sin/cos | ❌ | ✅ | `glassbox.py` `DatetimeFeatures` |
-| Prep | Leakage flag \|r\|>0.99 with target | ❌ | ✅ | `screening.py` `target_leakage_screen` |
-| Prep | Drop constant + ID-like with logged reason | ✅ | ✅ | `glassbox.py` `build_plan` |
-| Log | JSON record per step | ⚠️ | ✅ | `glassbox.py` `introspect` |
-| API | `POST /datasets` | ❌ | ✅ | `main.py` `create_dataset` |
-| API | `GET /datasets/{id}` | ❌ | ✅ | `main.py` `get_dataset` |
-| API | `GET /datasets/{id}/profile` | ❌ | ✅ | `main.py` `get_profile` |
-| API | `POST /datasets/{id}/preprocess` (target, scaler, options) | ❌ | ✅ | `main.py` `preprocess_dataset` |
-| API | `GET /datasets/{id}/preprocess/log` | ❌ | ✅ | `main.py` `get_preprocess_log` |
-| API | Pydantic schemas | ❌ | ✅ | `app/schemas.py` |
-| API | Correct 4xx errors | ✅ | ✅ | `main.py`, `tests/test_api.py` |
-| DB | SQLAlchemy 2.x + Alembic on SQLite | ❌ | ✅ | `app/db.py`, `migrations/` |
-| DB | `datasets`, `profiles`, `preprocessing_runs`, `preprocessing_logs` | ❌ | ✅ | `app/db.py` |
-| DB | `project_id` + `created_at` on every table | ❌ | ✅ | `db.py` `TimestampedProjectMixin` |
-| Storage | `StorageBackend` interface + `LocalStorage` | ❌ | ✅ | `app/storage.py` |
-| UI | Upload page | ✅ | ✅ | `Upload.tsx` |
-| UI | Profile dashboard: health score | ✅ | ✅ | `Results.tsx`, `HealthBreakdown` |
-| UI | Profile dashboard: per-column flag table | ❌ | ✅ | `ColumnTable.tsx` |
-| UI | Glass-box log, card per step, reason + before→after | ✅ | ✅ | `StepCard.tsx`, `TransformStrip.tsx` |
-| Config | All thresholds in one module | ❌ | ✅ | `app/config.py` |
-| Tests | One per preprocessing rule | ✅ | ✅ | `tests/test_rules.py` |
-| Tests | Leakage: test-split stats never reach fit | ✅ | ✅ | `tests/test_leakage.py` |
-| Tests | API happy path + bad file | ✅ | ✅ | `tests/test_api.py` |
-| Tests | `tests/fixtures` dataset | ❌ | ✅ | `tests/fixtures/titanic.csv` |
-
-## Bugs found and fixed
-
-1. **`describe_task` mislabelled categorical targets** — a text target with 21–50
-   distinct values returned `"regression"`, which **disabled stratification** on real
-   multiclass problems. Only numeric columns can be regressions now.
-   *Fixed in `target.py`; covered by a parametrised test including the exact case.*
-2. **Upload size cap applied after buffering** — `await file.read()` materialised the
-   whole body before the check. Now refused from `Content-Length` in middleware, with a
-   streaming cap as backstop. *Verified: a 51 MB POST returns 413.*
-3. **`Content-Disposition` built from the raw client filename** — quotes and CRLF
-   survived `Path(name).stem`. Now sanitised to a known-good character set.
-   *Covered by a test that uploads `evil";\r\nX-Injected: yes.csv` and asserts no
-   injected header.*
-4. **`_RUNS` held 20 full DataFrames** as the only copy of a run. Now a cache in front
-   of the database and storage; a miss reads back the stored artefacts.
-5. **Exported loader drifted from the real ingest** — still true for duplicate-header
-   disambiguation; see *Known limitations* below.
-6. **A boolean column crashed the entire run** — found while writing the new tests, not
-   during the audit. `SimpleImputer` rejects `bool` dtype, so any file with a real
-   `True`/`False` column failed with a dtype error. *Fixed by `CategoricalCast`, which
-   also handles pandas nullable extension dtypes.*
-7. **Dates were never parsed from uploads** — found during end-to-end verification. A
-   CSV carries no dtypes, so the datetime feature work was unreachable from the actual
-   upload path and date columns were one-hot encoded into a column per timestamp.
-   *Fixed in `ingest.py`, gated on a four-digit year so version numbers and scores are
-   not turned into 1970 timestamps.*
-8. **Unreachable branch in the identifier screen** — required `unique_rate == 1.0`,
-   which the preceding `>= 0.98` branch always caught first. *Removed.*
-
-## Leakage risks — resolved
-
-1. **Routing decisions read the full frame.** `profile_frame` and the identifier screen
-   ran before the split, so cardinality, missing rate and uniqueness included held-out
-   rows, and which columns survived was a function of test data. **Fixed**:
-   `fit_preprocessing` now splits first, and screens are injected callables run on the
-   training fold.
-
-   Verified to be a real behavioural change, not a cosmetic one: under the old ordering,
-   tampering with only the held-out rows flipped a column from one-hot to
-   high-cardinality encoding. Under the new ordering the plan is byte-identical.
-   `tests/test_leakage.py` asserts exactly this.
-2. **No target-correlation leakage screen.** **Fixed**: `target_leakage_screen` flags any
-   feature correlating above `LEAKAGE_CORRELATION` with the target. It flags and never
-   drops — the spec's word, and the right one, since only the person who exported the
-   file knows whether the column is a mistake or the point.
-3. `TargetEncoder` was added, which does read `y`. A spy test asserts it never sees a
-   held-out label, and its cross-fitting is verified by checking a training row's encoded
-   value is *not* the mean of its own category.
-
-## Upload security — resolved
-
-1. **Unbounded read before the cap** — fixed, see Bugs 2.
-2. **Header injection via filename** — fixed, see Bugs 3.
-3. **No declared content-type check** — extension validation in `ingest.py` remains the
-   gate, but it now runs after a bounded read rather than an unbounded one.
-4. **Storage path traversal** — new surface, closed on arrival: `storage.py` validates
-   every key segment, so a key built from a user filename cannot escape the root.
-5. **XLSX decompression bombs** — still unbounded; see *Known limitations*.
-
-## Dead code — removed
-
-- `backend/dropout_pipeline.py` — a generated export hardcoding a path in `~/Downloads`.
-- `backend/sample_data/student_dropout_sample.csv` — superseded by `app/sample/`.
-- `frontend/src/assets/` — `hero.png`, `react.svg`, `vite.svg`, referenced by nothing.
-- The unreachable identifier-screen branch (Bugs 8).
-
-## Known limitations
-
-Deliberately not fixed, and why.
-
-- **The exported script does not reproduce header disambiguation.** `_tidy_headers`
-  renames unnamed and duplicate columns; the generated `load_frame()` only strips
-  whitespace. An export from a file with duplicate headers will not reproduce the
-  analysed frame. Narrow enough to be worth stating rather than papering over.
-- **XLSX parsing is unbounded.** A decompression-bomb `.xlsx` within the 50 MB cap can
-  still expand arbitrarily in memory. Fixing it means either bounding openpyxl or
-  pre-scanning the archive, both of which are more machinery than a localhost demo
-  warrants.
-- **Ambiguous dates are read month-first.** `05/01/2024` is May 1st, not 1 May. There is
-  no way to infer the intent from the file, and asking would be a UI this phase does not
-  have.
-- **No accounts.** `project_id` is always `"default"`.
-
-## Verification
-
-Run on 2026-09-20 from a clean state — database deleted, storage deleted, migrations
-applied from zero.
-
-| Check | Result |
-|---|---|
-| `alembic upgrade head` on an empty database | 4 tables, each with `project_id` + `created_at` |
-| `pytest tests/ -q` | 137 passed |
-| `uvicorn app.main:app` | starts, `/api/health` responds |
-| `npm run build` | builds clean |
-| `npm run lint` | clean |
-| End-to-end on `tests/fixtures/titanic.csv` over HTTP | upload → profile → preprocess → log → downloads, all 200 |
-| Exported script | compiles and runs standalone, both encoders |
-| Cold-start restart | joblib pipeline reloads and transforms all 891 rows |
-| UI | verified in a browser at desktop and 375px widths |
-
-End-to-end result on the fixture: 891 rows, health 86, target `Survived` detected as
-binary classification, 712/179 split, 22 features, `PassengerId`/`Ticket`/`Name`/`Cabin`
-set aside with reasons, 7 step cards including the datetime derivation.
-
+Status: ✅ done · ⚠️ partial · ❌ absent.
 
 ---
 
-# Phase 2 — the interactive platform
+## Coverage
 
-Built 2026-09-20 on top of the Phase 1 engine. The brief was a full preprocessing
-workspace: a landing page, three-panel IDE, per-step toggles with consequences stated
-before they apply, a code editor whose output actually runs, sandboxed execution, and a
-download centre.
+| Area | § | | Evidence | Gap / fix |
+|---|---|---|---|---|
+| **Ingestion** ||||
+| CSV delimiter sniffing | 1 | ✅ | `ingest.py:117` | — |
+| XLSX read | 1 | ✅ | `ingest.py:453` | — |
+| XLSX **sheet select** | 1 | ❌ | `ingest.py:453` | `read_excel` takes no `sheet_name`; only sheet 1 reachable |
+| Encoding fallback | 1 | ✅ | `ingest.py:102` | — |
+| 50 MB cap, enforced while streaming | 1 | ✅ | `main.py:163`, `:135` | — |
+| Reject empty / single-column | 1 | ✅ | `ingest.py:500,524` | — |
+| Reject **headerless** | 1 | ❌ | — | A data-first row is silently promoted to headers |
+| Column sanitisation | 1 | ✅ | `ingest.py:240` | — |
+| **original→clean mapping** | 1 | ❌ | `ingest.py:240` | Returns a count; mapping discarded |
+| Numeric `1,234` `$5` `12%` | 1 | ⚠️ | `ingest.py:150` | Works, but `12%`→`12` not `0.12`, undocumented |
+| Booleans `true/false` | 1 | ✅ | pandas native | — |
+| Booleans **`yes/no`, `y/n`** | 1 | ❌ | — | Stays `object`, later ordinal-encoded |
+| Datetime ≥90% parse rate | 1 | ⚠️ | `ingest.py:202,226,232` | Gate is **100%**; 95%-valid column stays text |
+| Free text flag + exclude | 1 | ⚠️ | `glassbox.py:184`, `:606` | Threshold `rate>0.5 AND n>50`, not spec's ratio |
+| ID-like >0.95 | 1 | ⚠️ | `screening.py:74`, `config.py:126` | Threshold **0.98** |
+| Constant / **near-constant ≥99%** | 1 | ⚠️ | `glassbox.py:175` | Exact constants only |
+| **User type override** | 1 | ❌ | `schemas.py:51`, `pipeline.py:129` | Only global booleans; no per-column field |
+| **Profiling** ||||
+| Type, missing %, unique | 2 | ✅ | `profile.py:96` | — |
+| **Top values** per column | 2 | ❌ | — | Only for the target |
+| **Numeric mean/std/min/max** | 2 | ❌ | — | Absent from the profile payload |
+| Skew | 2 | ⚠️ | `health.py:307` | Dataset-level only; threshold 2.0 not 1.0 |
+| IQR outlier % | 2 | ✅ | `profile.py:38` | — |
+| **Histogram bins** | 2 | ❌ | — | No backend source for the §9 histogram |
+| Duplicate rows | 2 | ✅ | `profile.py:150` | — |
+| High-corr pairs >0.9 | 2 | ✅ | `screening.py:186` | Computed on full frame, not train |
+| Target distribution | 2 | ✅ | `target.py:241` | — |
+| **Imbalance ratio always reported** | 2 | ⚠️ | `target.py:220` | Returns `None` unless ratio ≥3, so balanced targets report nothing |
+| Health score + breakdown | 2 | ✅ | `ingest.py:273`, `health.py:443` | Two parallel scoring systems — worth unifying |
+| Warnings `{severity, message, suggestion}` | 2 | ⚠️ | `ingest.py:66`, `health.py:479` | No `suggestion`; severity is `info\|warning`, spec wants `info\|warn\|critical` |
+| **Task detection** ||||
+| Classification/regression rule | 3 | ✅ | `target.py:173` | — |
+| **User override of task** | 3 | ❌ | `main.py:425` | Target overridable, task is not |
+| Missing-target rows dropped + logged | 3 | ✅ | `main.py:410` | Logged to `cleaning`, not the step log |
+| Class <2 → **warn** + non-stratified | 3 | ⚠️ | `glassbox.py:1297` | Falls back **silently** |
+| **Planner / Executor** ||||
+| **Per-column plan + reasons** | 4 | ⚠️ | `glassbox.py:422,546` | Actions are per *group*, one shared reason per step |
+| **Plan editable per column** | 4 | ❌ | `main.py:428` | `excluded=` exists but no route accepts it |
+| Dedupe pre-split | 4a | ⚠️ | `codegen.py:211` | Codegen path only; glass-box path **counts but never removes** |
+| Datetime y/m/dow/hour + sin/cos | 4a | ✅ | `glassbox.py:336` | — |
+| Split 80/20 stratified, seeded | 4b | ✅ | `glassbox.py:1295`, `config.py:173` | — |
+| **Decisions on TRAIN only** | 4c | ✅ | `glassbox.py:1247`; `test_leakage.py` | Stricter than spec — profiling is train-only too |
+| Drop if missing >60% | 4c | ✅ | `glassbox.py:600` | — |
+| Impute median / mode | 4c | ✅ | `glassbox.py:630` | — |
+| **Missing-indicator when >5%** | 4c | ❌ | — | — |
+| **Rare categories <1% → "Other"** | 4c | ❌ | — | — |
+| Binary→0/1, ≤10→one-hot ignore | 4c | ✅ | `glassbox.py:697,699` | — |
+| >10 → cross-fitted TargetEncoder | 4c | ⚠️ | `config.py:186` | Available; **default is frequency** |
+| Scaling Standard/MinMax/Robust | 4c | ✅ | `glassbox.py:471` | — |
+| Scaling **None** | 4c | ⚠️ | `schemas.py:38` | No `"none"` value in the glass-box path |
+| Outliers **report-only default** | 4c | ⚠️ | `pipeline.py:187` | Default is `cap` — inverted |
+| IQR clipping, bounds from train | 4c | ⚠️ | `codegen.py:347` | Codegen path only |
+| **Skew >1 suggestion + Yeo-Johnson** | 4c | ❌ | — | — |
+| Leakage \|r\|>0.99 **detected** | 4c | ✅ | `screening.py:134` | Runs on train fold only |
+| **Leakage by depth-2 tree CV ≥0.98** | 4c | ❌ | — | — |
+| **Leakage excluded by default + critical** | 4c | ❌ | `screening.py:183` | Returns `({}, flags)` — flagged columns stay features |
+| **KS test train vs test** | 4d | ❌ | — | scipy is installed |
+| **Class balance in both splits** | 4d | ❌ | `main.py:450` | Whole frame only |
+| **Sanity baseline (Dummy vs LogReg/Ridge)** | 4e | ❌ | — | — |
+| **Glass-box log** ||||
+| Record shape | 5 | ⚠️ | `glassbox.py:1126` | Missing `seq`, `severity`, `overridden`; `run_id` added only at persist |
+| JSON-serialisable | 5 | ✅ | tested | — |
+| **Every column has a final fate** | 5 | ⚠️ | holds (12/12 probed) | **Never asserted** — no runtime check, no test |
+| **Runs & artifacts** ||||
+| Versioned runs | 6 | ⚠️ | `main.py:461`, `db.py:150` | Vacuous — no overrides exist to version; no parent-run column |
+| Pipeline joblib | 6 | ✅ | `main.py:552` | — |
+| **`plan.json` / `schema.json` / `log.json`** | 6 | ❌ | — | `schema.json` is the Phase 2 inference contract |
+| **train/test parquet** | 6 | ❌ | `main.py:560` | Train as CSV; **test never persisted** |
+| **Determinism hash** | 6 | ⚠️ | verified identical by probe | No hash computed, stored or asserted |
+| **API** ||||
+| `POST` / `GET /datasets` | 7 | ✅ | `main.py:634,682` | — |
+| `GET /datasets/{id}` | 7 | ✅ | `main.py:696` | — |
+| **`DELETE /datasets/{id}`** | 7 | ❌ | — | CORS also allows only GET/POST (`main.py:130`) |
+| `GET /datasets/{id}/profile` | 7 | ✅ | `main.py:707` | — |
+| **`GET /datasets/{id}/preview`** | 7 | ❌ | `workspace.py:559` | Only workspace-scoped |
+| **`POST /datasets/{id}/plan`** | 7 | ❌ | — | No propose-without-execute route |
+| **`POST /datasets/{id}/runs`** | 7 | ❌ | `main.py:735` | Exists as `/preprocess`, takes no plan |
+| `GET /runs/{id}` | 7 | ⚠️ | `main.py:784` | Returns the old preprocess payload |
+| **`GET /runs/{id}/log`** | 7 | ❌ | `main.py:758` | Dataset-scoped instead |
+| **`GET /runs/{id}/preview`** | 7 | ❌ | — | — |
+| **`GET /runs/{id}/artifacts/{name}`** | 7 | ❌ | `main.py:867,902` | Two fixed routes; joblib not downloadable |
+| **Uniform `{code, message, detail}`** | 7 | ❌ | `schemas.py:41` | Shape is `{"error": "…"}` |
+| Upload extension check | 7 | ✅ | `ingest.py:447` | — |
+| **Upload content check** | 7 | ❌ | — | No MIME or magic-byte sniff |
+| Path traversal blocked | 7 | ✅ | `storage.py:41` | — |
+| **DB** ||||
+| SQLAlchemy 2.x + Alembic + SQLite | 8 | ✅ | `db.py`, `migrations/` | — |
+| **`projects`** | 8 | ❌ | `db.py:93` | `project_id` is a bare string, no table or FK |
+| `datasets`, `profiles`, `preprocessing_runs` | 8 | ✅ | `db.py:101,129,150` | — |
+| **`dataset_columns`** | 8 | ❌ | `db.py:145` | Per-column data lives in `profiles.payload` JSON |
+| **`preprocessing_steps`** | 8 | ⚠️ | `db.py:181` | Named `preprocessing_logs` |
+| `project_id` + `created_at` on all | 8 | ✅ | `db.py:90` | Verified on all 7 tables |
+| `StorageBackend` + `LocalStorage` | 8 | ✅ | `storage.py:52,81` | — |
+| **UI** ||||
+| Upload drag-drop / progress / errors | 9 | ✅ | `UploadScreen.tsx:141,113,184` | — |
+| Dataset summary cards | 9 | ⚠️ | `Workspace.tsx:425` | Header strip; size never shown |
+| Health gauge + breakdown | 9 | ✅ | `InsightsPanel.tsx:85,181` | — |
+| Warnings with severity | 9 | ⚠️ | `InsightsPanel.tsx:238` | Two visual levels, no suggestion |
+| Column table | 9 | ⚠️ | `BottomDock.tsx:167` | No unique count, no flags |
+| **Type override dropdown** | 9 | ❌ | — | — |
+| **Histogram on column click** | 9 | ❌ | `BottomDock.tsx:178` | Click sorts; `recharts` installed and unused |
+| **Plan review screen** | 9 | ❌ | `App.tsx:16` | Routes: landing / upload / workspace |
+| **Target picker** | 9 | ❌ | `api.ts:35` | `config.target` never settable |
+| **Detected task shown** | 9 | ❌ | — | — |
+| Per-column actions + reasons | 9 | ⚠️ | `PipelinePanel.tsx:604` | Per-step |
+| **Per-column override dropdowns** | 9 | ❌ | — | — |
+| Scaler / outlier controls | 9 | ✅ | `PipelinePanel.tsx:274,135` | — |
+| **Missing-indicator toggle** | 9 | ❌ | — | — |
+| Timeline **grouped by stage** | 9 | ⚠️ | `InsightsPanel.tsx:347` | Flat numbered list |
+| **Severity colours in timeline** | 9 | ❌ | `api.ts:190` | Log carries no severity |
+| before→after per step | 9 | ⚠️ | `InsightsPanel.tsx:360` | Absolute, no delta |
+| Before/after data preview | 9 | ✅ | `BottomDock.tsx:90` | — |
+| **Split summary shown** | 9 | ❌ | `api.ts:219` | Data arrives, never rendered |
+| **Baseline scores** | 9 | ❌ | — | — |
+| Artifact downloads | 9 | ✅ | `Workspace.tsx:53` | — |
+| Runs history per dataset | 9 | ⚠️ | `BottomDock.tsx:355` | Edit trail, not selectable runs |
+| Loading / error / empty states | 9 | ✅ | throughout | — |
+| **Config** ||||
+| One config module | 10 | ✅ | `config.py` | — |
+| **Verification** ||||
+| **Fixture generator + 17 fixtures** | V | ❌ | only `titanic.csv` | — |
+| Leakage-invariance test | V | ✅ | `test_leakage.py` | — |
+| **Determinism / round-trip / log-invariant tests** | V | ❌ | — | — |
+| Output numeric, no NaN | V | ✅ | `test_codegen.py` | — |
+| API contract tests | V | ✅ | `test_api.py`, `test_workspace.py` | Need updating for new routes |
+| **Coverage ≥80%** | V | ❌ | no `pytest-cov`, no config | — |
+| **Playwright smoke** | V | ❌ | not installed | — |
+| Frontend typecheck script | V | ⚠️ | `package.json:7` | Only inside `build` |
+| **Pinned dependencies** | V | ❌ | — | **No Python manifest at all**; npm all `^` |
+| Type hints (app) | V | ⚠️ | `main.py:100,136,225,230,235` | 5 functions unannotated; rest 100% |
+| Type hints (tests) | V | ❌ | — | Largely unannotated |
+| **Performance on 10 MB** | V | ❌ | — | — |
 
-## What was added
+---
 
-| Area | Delivered | Where |
-|---|---|---|
-| Pipeline config | 8 steps, each independently configurable, fixed order | `app/pipeline.py` |
-| Code generation | Config → standalone runnable Python, the only such path | `app/codegen.py` |
-| Sandboxed execution | OS sandbox + rlimits + memory watchdog + timeout | `app/executor.py` |
-| Health engine | Six measured dimensions with evidence and arithmetic | `app/services/health.py` |
-| Impact analysis | Measured consequences of disabling any step | `app/services/impact.py` |
-| Workspace API | 12 routes; every mutation returns the whole workspace | `app/workspace.py` |
-| Persistence | `workspaces`, `compilations`, `history` tables | `app/db.py` |
-| Landing page | Hero with live preview, 8 sections | `frontend/src/landing/` |
-| Workspace UI | 3 panels + resizable dock, Monaco, impact dialog | `frontend/src/workspace/` |
-| Downloads | processed, original, code, config, report, zipped project | `app/workspace.py` |
+## Bugs
 
-## Bugs found while building, and fixed
+1. **Leakage columns are flagged but never excluded** (`screening.py:183`). Spec §4c
+   says exclude by default, critical warning, user re-includes. A column that is a copy
+   of the target currently enters the feature matrix with an advisory note. Most
+   consequential gap in the audit.
+2. **Class <2 samples falls back to non-stratified silently** (`glassbox.py:1297`). No
+   warning record, nothing in the payload.
+3. **Duplicates are counted but never removed** in the glass-box path
+   (`ingest.py:560`). Spec §4a requires dedupe pre-split; only the codegen path does it.
+4. **Headerless files are accepted**, first data row silently becoming column names.
+5. **`12%` → `12`**, not `0.12` (`ingest.py:150`). Silent change of quantity.
+6. **Datetime coercion needs a 100% parse rate** (`ingest.py:232`), spec says ≥90%.
+7. **Near-constant columns are kept** (`glassbox.py:175`) — only exact constants drop.
+8. **Imbalance ratio is withheld for balanced targets** (`target.py:220`), so the UI
+   cannot show the ratio the spec asks for.
+9. **Skew threshold is 2.0** (`health.py:314`), spec says 1.0.
+10. **`GET /runs/{id}` returns the old preprocess payload** — same URL, different object
+    from the run the spec describes.
 
-These were found by the tooling doing its job rather than by inspection, which is the
-only reason they are listed as findings rather than as design.
+## Leakage risks
 
-1. **Datetime expansion emitted dead columns.** A single-day date column produced 15
-   derived columns, 13 of them constant. The health engine's uniqueness dimension
-   caught it. Calendar parts that do not vary are now skipped: 26 output columns became
-   16 on the fixture.
-2. **The validity check inferred meaning from column names.** It flagged "Age should
-   not go below zero" on correctly *scaled* data, where half of every column is negative
-   by construction. Removed rather than patched — it was guesswork that misfired on
-   exactly the output this app produces.
-3. **Scale disparity reported 8×10³¹.** A near-constant column's "spread" was rounding
-   error. Columns with no real spread are now excluded from the ratio.
-4. **`RLIMIT_AS` does nothing on macOS.** The `setrlimit` call that appears as a memory
-   cap in most examples is silently refused at any value. Replaced with a watchdog
-   thread that polls the process group's resident size — verified to fire.
-5. **Monaco reset scroll to the top on every server update.** Changing a toggle threw
-   the reader back to line 1 from wherever they were. View state is now saved and
-   restored around the change.
-6. **A stale error marker survived a code edit**, pointing at a line that was no longer
-   the one that failed. The marker is retracted once the code differs from the run that
-   produced it; the log keeps the failure as history.
-7. **The generated file imported six sklearn transformers regardless of use**, so
-   "this step is off" was not completely true — the name remained in the imports. They
-   are now derived from the configuration.
+1. **Already closed, and stricter than required.** The split precedes profiling *and*
+   screening, not just fitting (`glassbox.py:1247`). `test_leakage.py` proves it by
+   rewriting held-out rows and asserting a byte-identical plan.
+2. **No train/test drift check** (§4d) — badly shifted splits pass unnoticed.
+3. **Leakage detection exists but takes no action** — see Bug 1.
 
-## The security position
+## Security
 
-The editor means the backend runs user-written Python. Layers, in order of strength:
-an OS sandbox profile denying network and out-of-directory writes; CPU, file-size and
-process-count limits; a memory watchdog; a wall-clock timeout on the process group; a
-scrubbed environment.
+1. **Content is never checked, only the extension.** A renamed binary reaches the
+   parser.
+2. **No `DELETE /datasets/{id}`** — uploads accumulate with no API to remove them.
+3. Not issues: path traversal is closed (`storage.py:41`); the code executor is
+   sandboxed and adversarially tested (`test_executor.py`).
 
-`tests/test_executor.py` attacks each of these for real — network, DNS, writes outside
-the work directory, `rmtree` of this repository, a shell-out to `rm` against a canary,
-a fork bomb, a memory bomb, an infinite loop — and asserts afterwards that the
-repository survived.
+## Dead code and drift
 
-**Stated limitation.** Without `sandbox-exec` only the process limits apply. The app
-reports which layer is active and the workspace shows it; the production answer is a
-container with no network namespace, and the executor is shaped so swapping one in
-means replacing a single function.
+1. **`recharts` and `framer-motion` installed, imported by zero files.** Histograms need
+   a chart library — use one or drop both.
+2. **`/api/analyse` and `/api/example` have no frontend caller.** Two API surfaces; the
+   product uses one.
+3. **`api.compilations()` defined and never called** (`frontend/src/api.ts:416`).
+4. **`eslint-disable` comment with no ESLint installed** (`BottomDock.tsx:84`).
+5. **Two parallel health scores** — `ingest._score_quality` and `health.assess`.
+6. **`workspaces`/`compilations`/`history` vs `preprocessing_runs`/`preprocessing_steps`**
+   — two overlapping models of the same idea.
 
-## Verification
+---
 
-Run from a clean state on 2026-09-20 — database deleted, storage deleted, migrations
-applied from zero.
+## The two structural gaps
 
-| Check | Result |
-|---|---|
-| `alembic upgrade head` from empty | 8 tables; `project_id` + `created_at` on all |
-| `pytest tests/ -q` | 244 passed |
-| `npm run build` / `npm run lint` | clean |
-| All 37 config permutations | generate code that compiles and runs |
-| Sandbox attacks | all contained; repository intact |
-| Full API flow over HTTP | upload → workspace → impact → compile → 6 downloads, all 200 |
-| Downloaded `pipeline.py` | compiles standalone |
-| Browser: landing, upload, workspace | verified |
-| Browser: toggle → impact dialog → compile | verified with measured 92 → 90 delta |
-| Browser: edit code → compile → error → reset | verified, line 295 diagnosed |
-| Responsive at 375 / 768 / 1440 | no horizontal overflow at any width |
+**1. There is no plan object.** `PipelineConfig` is per-*step* ("impute numerics with
+the median"). The spec wants per-*column* ("`Age` → impute median, because 20% missing,
+skew 0.4"), proposed by a planner, shown to the user, editable column by column, handed
+to an executor. That changes the data model, adds `POST /datasets/{id}/plan`, and adds a
+plan review screen.
 
-End-to-end on the fixture: 891 rows, health 90 → 92, 13 → 16 columns, compile in
-about 1.0s under the OS sandbox.
+**2. There is no run resource.** Execution produces a `compilation` tied to a
+`workspace`. The spec wants a versioned `run` at `/runs/{id}` carrying `plan.json`,
+`schema.json`, `log.json`, the joblib pipeline and train/test parquet — `schema.json`
+specifically so Phase 2 can run inference.
 
-## Known limitations
-
-- Compiling is synchronous. Correct at these file sizes; a dataset large enough to need
-  a queue would need streaming ingestion first.
-- The impact preview runs the pipeline to measure the projected score, so it costs
-  about a second. Showing a guessed number instantly was the alternative.
-- Feature selection's mutual-information ranking runs on the training fold only, but
-  `top_k` is applied globally rather than re-measured per fold.
-- Nested JSON is read without flattening. A column of objects profiles as free text and
-  is reported as such, which is a truthful description of a file that is not really
-  tabular, but it is not made useful.
+Neither is a rewrite. The engine, the leakage guarantee, the sandbox, the health
+dimensions and the storage layer all survive; this is a new layer over them plus an API
+and UI reshaped around it.
