@@ -17,10 +17,23 @@ is a decision informed by held-out data, however indirectly.
 A screen returns two things, and the difference is deliberate:
 
 * **drops** — columns that cannot be features, with a reason.
-* **flags** — columns that are suspicious but stay. The target-leakage screen only
-  flags: a column almost perfectly correlated with the target is usually a mistake in
-  the export, but sometimes it is the whole point of the dataset, and silently deleting
-  the user's most predictive column is the kind of help nobody asked for.
+* **flags** — columns worth warning about, whether or not they were dropped.
+
+Target leakage produces **both**: the column is excluded and a ``critical`` flag is
+raised. An earlier version only flagged, on the reasoning that deleting someone's most
+predictive column is unwelcome help. That reasoning was wrong, and the asymmetry is
+why. If the column really is legitimate, excluding it costs one click to put back — the
+flag carries ``can_reinclude`` and names the column. If it is derived from the answer
+and we merely mention it, the model scores beautifully, ships, and fails on live data,
+and the warning that would have prevented it was one line in a panel nobody re-read.
+The cheap mistake is recoverable; the expensive one is not.
+
+Two independent detectors run, because they catch different shapes of the same problem:
+
+* **Correlation** finds a linear copy — a rescaled or rounded target.
+* **A depth-2 decision tree, cross-validated** finds a non-linear one: a column that
+  splits the target almost perfectly without correlating with it at all, such as a
+  status string or a bucketed score.
 """
 
 from __future__ import annotations
@@ -30,12 +43,19 @@ import re
 import numpy as np
 import pandas as pd
 
+from sklearn.dummy import DummyClassifier
+from sklearn.model_selection import cross_val_score
+from sklearn.tree import DecisionTreeClassifier, DecisionTreeRegressor
+
 from app.config import (
     HIGH_CORRELATION,
     IDENTIFIER_UNIQUE_RATE,
     LEAKAGE_CORRELATION,
+    LEAKAGE_TREE_CV_FOLDS,
+    LEAKAGE_TREE_SCORE,
     MIN_ROWS_FOR_CORRELATION,
     NAMED_IDENTIFIER_UNIQUE_RATE,
+    SEED,
 )
 
 __all__ = [
@@ -131,56 +151,174 @@ def _numeric_view(series: pd.Series) -> pd.Series | None:
     return None
 
 
+def _is_classification_target(y: pd.Series) -> bool:
+    """Whether to probe with a classifier or a regressor."""
+    if not pd.api.types.is_numeric_dtype(y):
+        return True
+    return int(y.nunique(dropna=True)) <= 20
+
+
+def _probe_score(feature: pd.Series, y: pd.Series) -> float | None:
+    """How well this one column predicts the target, alone, in cross-validation.
+
+    A depth-2 tree on a single feature. Depth two can express "this column separates the
+    answer" — the question being asked — while being far too small to memorise the rows,
+    which is what would make every column look like a leak.
+
+    Scored against what a constant guess achieves, not against zero: on a 95/5 target a
+    useless column still scores 0.95 accuracy, and comparing to the majority-class
+    baseline is what separates "predicts the target" from "the target is lopsided".
+    Returns a value on that adjusted scale, or ``None`` when the column cannot be
+    probed.
+    """
+    frame = pd.concat([feature, y], axis=1).dropna()
+    if len(frame) < MIN_ROWS_FOR_CORRELATION:
+        return None
+
+    values, labels = frame.iloc[:, [0]], frame.iloc[:, 1]
+    if values.iloc[:, 0].nunique() < 2 or labels.nunique() < 2:
+        return None
+
+    classification = _is_classification_target(labels)
+    if classification:
+        # Every class needs at least one row per fold, or the split is impossible.
+        folds = min(LEAKAGE_TREE_CV_FOLDS, int(labels.value_counts().min()))
+        if folds < 2:
+            return None
+        model = DecisionTreeClassifier(max_depth=2, random_state=SEED)
+        scoring = "accuracy"
+    else:
+        folds = LEAKAGE_TREE_CV_FOLDS
+        model = DecisionTreeRegressor(max_depth=2, random_state=SEED)
+        scoring = "r2"
+
+    try:
+        score = float(cross_val_score(model, values, labels, cv=folds, scoring=scoring).mean())
+    except ValueError:
+        # Degenerate splits — not enough of some class to cross-validate. Not a leak,
+        # just not answerable.
+        return None
+
+    if not classification:
+        return score  # r2 is already "better than predicting the mean"
+
+    baseline = float(
+        cross_val_score(
+            DummyClassifier(strategy="most_frequent"), values, labels,
+            cv=folds, scoring=scoring,
+        ).mean()
+    )
+    if baseline >= 1.0:
+        return None
+    # Rescale so 0 is "no better than always guessing the majority" and 1 is perfect.
+    return (score - baseline) / (1.0 - baseline)
+
+
 def target_leakage_screen(
     X_train: pd.DataFrame, y_train: pd.Series
 ) -> tuple[dict[str, str], list[dict]]:
-    """Flag features that are almost a copy of the target.
+    """Find features that are copies of the target, exclude them, and say so loudly.
 
-    A correlation above :data:`LEAKAGE_CORRELATION` nearly always means the column was
-    derived from the answer — a ``final_grade`` next to a ``passed`` target, an exit
-    date next to ``churned``. A model trained on it scores beautifully and is useless,
-    because the column will not exist at prediction time.
+    Two detectors, because they catch different shapes:
 
-    Nothing is dropped. The spec's word is *flag*, and it is the right one: only the
-    person who exported the file knows whether the column is a mistake or the point.
+    * **Correlation** above :data:`LEAKAGE_CORRELATION` — a linear copy: the target
+      rescaled, rounded, or offset.
+    * **A depth-2 tree scoring above** :data:`LEAKAGE_TREE_SCORE` **in cross-validation**
+      — a non-linear one: a status string, a bucketed score, anything that splits the
+      answer cleanly while correlating with it barely at all.
+
+    Either is enough. The column is **excluded** and flagged ``critical``, with
+    ``can_reinclude`` set so the interface can offer it back. Excluding a legitimate
+    column costs one click; keeping a leaked one costs a model that works in testing and
+    fails in production.
+
+    Runs on the training fold only, like every other screen here.
     """
-    target_values = _numeric_view(y_train)
-    if target_values is None:
-        return {}, []
-
     flags: list[dict] = []
+    drops: dict[str, str] = {}
+    target_values = _numeric_view(y_train)
+    target_name = y_train.name or "the target"
+
     for name in X_train.columns:
         column = str(name)
-        feature_values = _numeric_view(X_train[column])
-        if feature_values is None:
+        series = X_train[column]
+
+        # --- linear copy ---------------------------------------------------------
+        correlation: float | None = None
+        feature_values = _numeric_view(series)
+        if feature_values is not None and target_values is not None:
+            pair = pd.concat([feature_values, target_values], axis=1).dropna()
+            if (
+                len(pair) >= MIN_ROWS_FOR_CORRELATION
+                and pair.iloc[:, 0].nunique() >= 2
+                and pair.iloc[:, 1].nunique() >= 2
+            ):
+                value = float(pair.iloc[:, 0].corr(pair.iloc[:, 1]))
+                correlation = None if np.isnan(value) else value
+
+        by_correlation = correlation is not None and abs(correlation) >= LEAKAGE_CORRELATION
+
+        # --- non-linear copy -----------------------------------------------------
+        # The tree needs numbers. Use the 0/1 view when the column has one, otherwise
+        # category codes — the tree only needs to be able to split on the values and
+        # does not care that the ordering is arbitrary. Passing the raw column through
+        # made the probe silently return None for every two-value string column, so the
+        # tree detector never ran on exactly the shape it was best at catching.
+        if pd.api.types.is_numeric_dtype(series):
+            probe_input = series
+        elif feature_values is not None:
+            probe_input = feature_values
+        else:
+            probe_input = series.astype("category").cat.codes.where(series.notna())
+        score = _probe_score(probe_input.rename(column), y_train)
+        by_tree = score is not None and score >= LEAKAGE_TREE_SCORE
+
+        if not (by_correlation or by_tree):
             continue
 
-        pair = pd.concat([feature_values, target_values], axis=1).dropna()
-        if len(pair) < MIN_ROWS_FOR_CORRELATION:
-            continue
-        if pair.iloc[:, 0].nunique() < 2 or pair.iloc[:, 1].nunique() < 2:
-            continue
+        if by_correlation and by_tree:
+            evidence = (
+                f"it moves almost exactly in step with {target_name} "
+                f"(correlation {correlation:+.3f}) and, on its own, predicts it in "
+                f"cross-validation ({score:.3f})"
+            )
+        elif by_correlation:
+            evidence = (
+                f"it moves almost exactly in step with {target_name} "
+                f"(correlation {correlation:+.3f})"
+            )
+        else:
+            evidence = (
+                f"on its own it predicts {target_name} almost perfectly in "
+                f"cross-validation ({score:.3f}), even though it does not correlate "
+                f"with it"
+            )
 
-        correlation = float(pair.iloc[:, 0].corr(pair.iloc[:, 1]))
-        if np.isnan(correlation) or abs(correlation) < LEAKAGE_CORRELATION:
-            continue
+        reason = (
+            f"{column} looks like it was derived from the answer: {evidence}. "
+            f"A model trained on it will score excellently here and fail on real cases, "
+            f"because the value will not exist yet at the moment you need a prediction. "
+            f"It has been left out. If you will genuinely have it in advance, put it back."
+        )
 
+        drops[column] = reason
         flags.append({
             "kind": "target_leakage",
             "column": column,
-            "correlation": round(correlation, 4),
-            "severity": "warning",
-            "reason": (
-                f"{column} moves almost exactly in step with {y_train.name} "
-                f"(correlation {correlation:+.3f}). That usually means it was worked out "
-                f"from the answer rather than known beforehand — a model trained on it "
-                f"will look excellent here and fail on real cases, because the column "
-                f"will not exist yet when you need a prediction. It has been kept as a "
-                f"feature: check whether you would really have it in advance."
+            "correlation": None if correlation is None else round(correlation, 4),
+            "probe_score": None if score is None else round(score, 4),
+            "detected_by": (
+                "correlation and single-feature tree" if by_correlation and by_tree
+                else "correlation" if by_correlation
+                else "single-feature tree"
             ),
+            "severity": "critical",
+            "excluded": True,
+            "can_reinclude": True,
+            "reason": reason,
         })
 
-    return {}, flags
+    return drops, flags
 
 
 def correlated_pairs(df: pd.DataFrame, threshold: float = HIGH_CORRELATION) -> list[dict]:

@@ -75,8 +75,11 @@ def test_the_fill_value_is_the_training_median_not_the_whole_files(frame) -> Non
     entry = next(e for e in result.log if e["stage"] == "impute" and "amount" in e["columns"])
     logged = entry["details"]["fill_values"]["amount"]
 
-    train_median = float(holes.loc[result.X_train.index, "amount"].median())
-    whole_median = float(holes["amount"].median())
+    # Index against the deduplicated frame: dedupe runs before the split and resets the
+    # index, so positions in `result` refer to that frame, not the one passed in.
+    deduped = holes.drop_duplicates().reset_index(drop=True)
+    train_median = float(deduped.loc[result.X_train.index, "amount"].median())
+    whole_median = float(deduped["amount"].median())
 
     assert logged == pytest.approx(train_median)
     # If the two coincided the assertion above would be satisfied by a leaking
@@ -277,7 +280,10 @@ def test_train_and_test_come_out_aligned_and_complete(frame) -> None:
     assert list(result.X_train.columns) == list(result.X_test.columns)
     assert not result.X_train.isna().any().any()
     assert not result.X_test.isna().any().any()
-    assert len(result.X_train) + len(result.X_test) == len(frame)
+    # Duplicates are removed before the split (spec §4a), so the folds sum to the
+    # deduplicated row count rather than the raw one. Comparing against len(frame)
+    # would make this test fail whenever the fixture happens to repeat a row.
+    assert len(result.X_train) + len(result.X_test) == len(frame.drop_duplicates())
     assert not set(result.X_train.index) & set(result.X_test.index)
 
 

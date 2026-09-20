@@ -35,8 +35,15 @@ __all__ = [
     "IDENTIFIER_UNIQUE_RATE",
     "NAMED_IDENTIFIER_UNIQUE_RATE",
     "LEAKAGE_CORRELATION",
+    "LEAKAGE_TREE_SCORE",
+    "LEAKAGE_TREE_FOLDS",
+    "LEAKAGE_TREE_DEPTH",
     "HIGH_CORRELATION",
     "MIN_ROWS_FOR_CORRELATION",
+    "DRIFT_P_VALUE",
+    "BASELINE_CV_FOLDS",
+    "MIN_ROWS_FOR_BASELINE",
+    "MIN_ROWS_FOR_DRIFT",
     "OUTLIER_IQR_MULTIPLIER",
     "IMBALANCE_RATIO",
     "MAX_TARGET_CLASSES",
@@ -138,6 +145,38 @@ NAMED_IDENTIFIER_UNIQUE_RATE = _float("NAMED_IDENTIFIER_UNIQUE_RATE", 0.90)
 #: Deliberately just below 1.0: an exact copy of the target is rare, a rounded or
 #: rescaled copy is common, and both should be caught.
 LEAKAGE_CORRELATION = _float("LEAKAGE_CORRELATION", 0.99)
+
+#: A single feature that predicts the target this well, on its own, in cross-validation,
+#: is almost certainly derived from it. Catches the non-linear copies correlation
+#: misses: a status string, a bucketed score, anything that splits the answer cleanly
+#: without moving in step with it.
+LEAKAGE_TREE_SCORE = _float("LEAKAGE_TREE_SCORE", 0.98)
+
+#: Folds for that check. Five is enough to be stable and cheap enough to run per column.
+LEAKAGE_TREE_FOLDS = _int("LEAKAGE_TREE_FOLDS", 5)
+LEAKAGE_TREE_CV_FOLDS = LEAKAGE_TREE_FOLDS
+
+#: Depth of the probe tree. Two levels can express "this column separates the classes",
+#: which is the question, without being able to memorise the training rows, which would
+#: make every column look like a leak.
+LEAKAGE_TREE_DEPTH = _int("LEAKAGE_TREE_DEPTH", 2)
+
+#: A feature whose train/test distributions differ at this p-value is flagged as drift.
+#: Deliberately strict: at 0.05, one feature in twenty is flagged by chance, which on a
+#: fifty-column dataset means two or three false alarms every run and a warning nobody
+#: reads.
+DRIFT_P_VALUE = _float("DRIFT_P_VALUE", 0.01)
+
+#: Below this many rows on either side, a KS test is dominated by sampling noise.
+MIN_ROWS_FOR_DRIFT = _int("MIN_ROWS_FOR_DRIFT", 20)
+
+#: Folds for the sanity baseline. Five is the usual compromise between a stable
+#: estimate and the time it costs.
+BASELINE_CV_FOLDS = _int("BASELINE_CV_FOLDS", 5)
+
+#: Below this many training rows a cross-validated score says more about the split than
+#: about the data, so no baseline is reported rather than a misleading one.
+MIN_ROWS_FOR_BASELINE = _int("MIN_ROWS_FOR_BASELINE", 40)
 
 #: Correlation between two features above which they are reported as redundant.
 HIGH_CORRELATION = _float("HIGH_CORRELATION", 0.90)

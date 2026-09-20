@@ -184,7 +184,13 @@ def test_datetime_features_map_back_to_their_source_column(frame) -> None:
 # --------------------------------------------------------------------------------------
 
 
-def test_a_copy_of_the_target_is_flagged_and_kept(frame) -> None:
+def test_a_copy_of_the_target_is_flagged_and_excluded(frame) -> None:
+    """Spec §4c: a leaked column is excluded by default, not merely mentioned.
+
+    The asymmetry is the argument. Excluding a legitimate column costs one click to put
+    back; keeping a leaked one costs a model that scores well in testing and fails in
+    production, with the warning that would have prevented it sitting unread in a panel.
+    """
     leaked = frame.copy()
     rng = np.random.default_rng(0)
     leaked["score"] = leaked["label"] * 100 + rng.normal(0, 0.01, len(leaked))
@@ -195,10 +201,17 @@ def test_a_copy_of_the_target_is_flagged_and_kept(frame) -> None:
 
     flagged = [f["column"] for f in result.flags]
     assert "score" in flagged
-    assert abs(result.flags[0]["correlation"]) >= LEAKAGE_CORRELATION
-    # Flagged, not dropped — the spec's word, and the user's decision.
-    assert "score" not in result.plan.dropped
-    assert "score" in result.plan.numeric
+
+    flag = next(f for f in result.flags if f["column"] == "score")
+    assert abs(flag["correlation"]) >= LEAKAGE_CORRELATION
+    assert flag["severity"] == "critical"
+    assert flag["excluded"] is True
+    assert flag["can_reinclude"] is True, "the user must be able to put it back"
+
+    # Excluded, and out of the feature matrix entirely.
+    assert "score" in result.excluded
+    assert "score" not in result.plan.numeric
+    assert "score" not in result.X_train.columns
 
 
 def test_an_ordinary_feature_is_not_flagged(frame) -> None:

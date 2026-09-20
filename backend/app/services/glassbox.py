@@ -91,6 +91,7 @@ from sklearn.preprocessing import (
 )
 from sklearn.utils.validation import check_is_fitted
 
+from app.services.checks import run_post_split_checks, sanity_baseline
 from app.config import (
     DEFAULT_HIGH_CARD_ENCODER,
     DEFAULT_SCALER,
@@ -1220,9 +1221,14 @@ class PreprocessingResult:
     #: user. Screener entries are produced from the training fold only, so this is the
     #: authoritative record of what was set aside and why.
     excluded: dict[str, str] = field(default_factory=dict)
-    #: Columns a screener flagged as suspicious without removing them — currently the
-    #: target-leakage screen. Flagged columns are still used as features, by design.
+    #: Records from the screens — what was flagged, why, and whether it was excluded.
     flags: list[dict[str, Any]] = field(default_factory=list)
+    #: Conditions the user needs to know about that are not tied to one column, such as
+    #: a split that could not be stratified. Shaped like the spec's §2 warnings:
+    #: ``{severity, message, suggestion}``.
+    warnings: list[dict[str, Any]] = field(default_factory=list)
+    #: Post-split checks (§4d): per-feature drift and class balance in both folds.
+    checks: dict[str, Any] = field(default_factory=dict)
     #: The split parameters actually used. Recorded rather than recovered: deriving
     #: test_size back from the row counts rounds, and a rounded fraction re-enters
     #: `train_test_split` as a different ceiling — an 891-row file exported at 0.2009
@@ -1289,23 +1295,74 @@ def fit_preprocessing(
         raise ValueError(f"target column {target!r} is not in the frame")
     classification = _is_classification(task_type)
 
-    # 1. Separate the label from the features.
+    # 1. Stateless repairs that must precede the split (spec §4a).
+    #
+    #    Deduplication belongs here and nowhere else. A repeated row left in place is
+    #    counted twice when the model fits, and — worse — its copies can land on
+    #    opposite sides of the split, so the model is scored on rows it has already
+    #    trained on. Removing them after the split would not undo that.
+    duplicate_rows = int(df.duplicated().sum())
+    if duplicate_rows:
+        df = df.drop_duplicates().reset_index(drop=True)
+
+    # 2. Separate the label from the features.
     y = df[target]
     X = df.drop(columns=[target])
 
     # 2. Split FIRST — before any column is profiled, screened or fitted. Stratify so a
     #    rare class is represented in both folds; fall back when a class is too small to
     #    appear on both sides.
+    warnings: list[dict[str, Any]] = []
+    if duplicate_rows:
+        warnings.append({
+            "kind": "duplicates_removed",
+            "severity": "info",
+            "message": f"Removed {duplicate_rows:,} duplicate row(s) before splitting.",
+            "suggestion": (
+                "Copies of one row can otherwise land on both sides of the split, which "
+                "makes any score on the held-out rows optimistic."
+            ),
+            "count": duplicate_rows,
+        })
     stratify = None
     if classification:
         counts = y.value_counts(dropna=False)
+        singletons = counts[counts < 2]
         if len(counts) > 1 and int(counts.min()) >= 2:
             stratify = y
+        elif len(singletons):
+            # Falling back silently would leave the user believing their rare class is
+            # represented on both sides of the split when it cannot be. The whole point
+            # of stratifying is the rare class, so losing it is exactly what needs
+            # saying.
+            named = ", ".join(str(v) for v in singletons.index[:5])
+            warnings.append({
+                "kind": "stratification_disabled",
+                "severity": "warn",
+                "message": (
+                    f"{len(singletons)} class(es) have fewer than 2 rows ({named}), so "
+                    "the split could not be stratified."
+                ),
+                "suggestion": (
+                    "The train and test folds may not contain the same classes. Collect "
+                    "more examples of the rare class, or merge it into a neighbouring "
+                    "one, before trusting any score."
+                ),
+                "classes": {str(k): int(v) for k, v in singletons.items()},
+            })
     X_train_raw, X_test_raw, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=seed, shuffle=True, stratify=stratify
     )
+    if classification and stratify is None and not warnings:
+        warnings.append({
+            "kind": "stratification_disabled",
+            "severity": "warn",
+            "message": "The split was not stratified: the target has only one class.",
+            "suggestion": "A single-class target cannot be predicted; pick another column.",
+            "classes": {},
+        })
 
-    # 3. Screen and profile the TRAINING fold only. Both are measurements, so both
+    # 4. Screen and profile the TRAINING fold only. Both are measurements, so both
     #    belong on this side of the split: uniqueness, missing rate and cardinality all
     #    decide which columns survive and how they are encoded.
     removals = dict(excluded or {})
@@ -1325,7 +1382,7 @@ def fit_preprocessing(
         high_card_encoder=high_card_encoder,
     )
 
-    # 4. Remove the columns the plan rejected, from both folds identically.
+    # 5. Remove the columns the plan rejected, from both folds identically.
     to_drop = [c for c in plan.dropped if c in X_train_raw.columns]
     X_train_raw = X_train_raw.drop(columns=to_drop)
     X_test_raw = X_test_raw.drop(columns=to_drop)
@@ -1335,13 +1392,31 @@ def fit_preprocessing(
             + json.dumps(plan.dropped, indent=2)
         )
 
-    # 5. Fit on the training partition only, then apply the frozen pipeline to the test
+    # 6. Fit on the training partition only, then apply the frozen pipeline to the test
     #    partition. This is the one and only `.fit` in the module's data path.
     pipeline = build_pipeline(plan)
     X_train_out = pipeline.fit_transform(X_train_raw, y_train)
     X_test_out = pipeline.transform(X_test_raw)
 
-    # 6. Explain what was learned, and record where each output column came from.
+    # 7. Check the split itself (spec §4d). These measure the division of the data
+    #    rather than the data, and a pipeline can be correct in every step and still
+    #    produce folds that do not resemble each other.
+    checks = run_post_split_checks(X_train_out, X_test_out, y_train, y_test)
+    checks["baseline"] = sanity_baseline(X_train_out, y_train, task_type, seed)
+    warnings.extend(checks["warnings"])
+    if checks["baseline"] and checks["baseline"]["severity"] == "warn":
+        checks["baseline"]["kind"] = "weak_baseline"
+        warnings.append({
+            "kind": "weak_baseline",
+            "severity": "warn",
+            "message": checks["baseline"]["verdict"],
+            "suggestion": (
+                "Check the plan above: a step may be removing the signal, or the target "
+                "may not be predictable from these columns."
+            ),
+        })
+
+    # 8. Explain what was learned, and record where each output column came from.
     log = introspect(pipeline, plan, X_train_raw)
     feature_map = build_feature_map(pipeline, plan)
 
@@ -1356,6 +1431,8 @@ def fit_preprocessing(
         feature_map=feature_map,
         excluded=removals,
         flags=flags,
+        warnings=warnings,
+        checks=checks,
         test_size=test_size,
         seed=seed,
     )
