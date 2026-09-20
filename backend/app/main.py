@@ -339,7 +339,7 @@ def _quality_block(ingested: IngestResult, rows_used: int) -> dict[str, Any]:
         "rows_used": rows_used,
         "missing_cells": ingested.missing_cells,
         "duplicate_rows": ingested.duplicate_rows,
-        "issues": [{"severity": i.severity, "text": i.text} for i in ingested.issues],
+        "issues": [i.as_dict() for i in ingested.issues],
         "breakdown": ingested.quality_breakdown,
     }
 

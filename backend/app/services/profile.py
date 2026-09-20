@@ -19,11 +19,26 @@ from typing import Any
 
 import pandas as pd
 
-from app.config import MAX_MISSING_RATE, OUTLIER_IQR_MULTIPLIER
+import numpy as np
+
+from app.config import (
+    HISTOGRAM_BINS,
+    MAX_MISSING_RATE,
+    OUTLIER_IQR_MULTIPLIER,
+    SKEW_THRESHOLD,
+    TOP_VALUES,
+)
 from app.services.glassbox import ColumnProfile, profile_frame
 from app.services.screening import correlated_pairs
 
-__all__ = ["column_profiles", "outlier_summary", "build_profile"]
+__all__ = [
+    "column_profiles",
+    "outlier_summary",
+    "numeric_summary",
+    "histogram",
+    "top_values",
+    "build_profile",
+]
 
 #: How each internal ``kind`` is described to someone who does not think in dtypes.
 _KIND_LABEL = {
@@ -66,6 +81,93 @@ def outlier_summary(series: pd.Series) -> dict[str, Any] | None:
         "lower": round(lower, 4),
         "upper": round(upper, 4),
     }
+
+
+def numeric_summary(series: pd.Series) -> dict[str, Any] | None:
+    """Descriptive statistics for one numeric column, or ``None`` for anything else.
+
+    Skew is included because it is the statistic that changes what you should *do*: a
+    column with |skew| above 1 is a candidate for a log or Yeo-Johnson transform, and
+    is also the reason a mean and a median disagree. Both are reported so the reader
+    can see that disagreement rather than take the skew number on trust.
+    """
+    if not pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+        return None
+    values = series.dropna().astype("float64")
+    if values.empty:
+        return None
+
+    skew = float(values.skew()) if len(values) > 2 and values.nunique() > 1 else 0.0
+    return {
+        "count": int(values.size),
+        "mean": round(float(values.mean()), 6),
+        "std": round(float(values.std()), 6) if len(values) > 1 else 0.0,
+        "min": round(float(values.min()), 6),
+        "q1": round(float(values.quantile(0.25)), 6),
+        "median": round(float(values.median()), 6),
+        "q3": round(float(values.quantile(0.75)), 6),
+        "max": round(float(values.max()), 6),
+        "skew": round(skew, 4),
+        "skewed": bool(abs(skew) > SKEW_THRESHOLD),
+    }
+
+
+def histogram(series: pd.Series, bins: int = HISTOGRAM_BINS) -> dict[str, Any] | None:
+    """Bin counts for a numeric column, computed server-side.
+
+    Computed here rather than in the browser because the browser holds one page of rows
+    and would draw a different distribution on every page — a histogram of 25 rows is
+    not a histogram of the column.
+
+    Categorical columns get their value counts instead, which is the same question
+    ("how is this distributed?") answered the way that column can answer it.
+    """
+    values = series.dropna()
+    if values.empty:
+        return None
+
+    if pd.api.types.is_bool_dtype(series) or not pd.api.types.is_numeric_dtype(series):
+        counts = values.value_counts().head(bins)
+        return {
+            "kind": "categorical",
+            "labels": [str(v) for v in counts.index],
+            "counts": [int(v) for v in counts.values],
+            "other": int(len(values) - int(counts.sum())),
+        }
+
+    numbers = values.astype("float64")
+    if numbers.nunique() == 1:
+        only = float(numbers.iloc[0])
+        return {
+            "kind": "numeric", "bins": 1, "edges": [only, only],
+            "counts": [int(numbers.size)],
+        }
+
+    counts, edges = np.histogram(numbers.to_numpy(), bins=min(bins, max(numbers.nunique(), 2)))
+    return {
+        "kind": "numeric",
+        "bins": int(len(counts)),
+        "edges": [round(float(e), 6) for e in edges],
+        "counts": [int(c) for c in counts],
+    }
+
+
+def top_values(series: pd.Series, limit: int = TOP_VALUES) -> list[dict[str, Any]]:
+    """The most frequent values, with their share.
+
+    Shown for every column kind, not only categoricals: the most common value of a
+    numeric column is how you notice that 40% of it is zero, which no mean or quartile
+    reveals.
+    """
+    values = series.dropna()
+    if values.empty:
+        return []
+    counts = values.value_counts().head(limit)
+    total = int(values.size)
+    return [
+        {"value": str(index), "count": int(count), "share": round(int(count) / total, 4)}
+        for index, count in counts.items()
+    ]
 
 
 def _flags(profile: ColumnProfile, outliers: dict | None, leaking: bool) -> list[str]:
@@ -114,7 +216,8 @@ def column_profiles(
 
     records: list[dict[str, Any]] = []
     for name, profile in profiles.items():
-        outliers = outlier_summary(df[name])
+        series = df[name]
+        outliers = outlier_summary(series)
         is_target = name == target
         records.append({
             "column": name,
@@ -127,6 +230,9 @@ def column_profiles(
             "unique_rate": round(profile.unique_rate, 4),
             "n_rows": n_rows,
             "outliers": outliers,
+            "stats": numeric_summary(series),
+            "histogram": histogram(series),
+            "top_values": top_values(series),
             "is_target": is_target,
             "used": not is_target and name not in excluded,
             "excluded_reason": excluded.get(name),

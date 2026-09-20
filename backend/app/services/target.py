@@ -12,7 +12,7 @@ from dataclasses import dataclass
 
 import pandas as pd
 
-from app.config import IMBALANCE_RATIO, MAX_TARGET_CLASSES
+from app.config import IMBALANCE_RATIO, MAX_CLASSES_LISTED, MAX_TARGET_CLASSES
 
 __all__ = [
     "TargetGuess",
@@ -211,29 +211,69 @@ def class_balance(series: pd.Series) -> dict | None:
     and this phase of the app does not train a model — but a user who does not know
     their positives are 4% of the file will read a 96% accuracy as good news.
     """
+    # A continuous target has no classes to balance. Without this guard a regression
+    # column enumerates one "class" per distinct value — 500 of them for a price — and
+    # reports a meaningless 1:1 ratio over the lot.
+    if pd.api.types.is_numeric_dtype(series) and not pd.api.types.is_bool_dtype(series):
+        if int(series.nunique(dropna=True)) > MAX_TARGET_CLASSES:
+            return None
+
     counts = series.value_counts(dropna=True)
     if len(counts) < 2:
         return None
 
     largest, smallest = int(counts.iloc[0]), int(counts.iloc[-1])
     ratio = largest / max(smallest, 1)
-    if ratio < IMBALANCE_RATIO:
-        return None
-
     total = int(counts.sum())
+
+    # The ratio is reported whether or not it crosses the threshold. Returning None for
+    # a balanced target meant the interface could not show "1.4 : 1" — it had nothing to
+    # show — so a user could not tell a balanced dataset from one that had not been
+    # checked. `imbalanced` carries the verdict; the number is always there.
+    imbalanced = ratio >= IMBALANCE_RATIO
     return {
         "ratio": round(ratio, 2),
+        "imbalanced": imbalanced,
+        "threshold": IMBALANCE_RATIO,
+        # Capped: this is rendered as a list in the interface, and a target with
+        # hundreds of classes would push everything else off the screen. The count is
+        # reported separately so nothing is hidden, only elided.
+        "n_classes": int(len(counts)),
+        "classes": [
+            {
+                "value": str(value),
+                "count": int(count),
+                "share": round(int(count) / total, 4),
+            }
+            for value, count in counts.head(MAX_CLASSES_LISTED).items()
+        ],
         "majority_class": str(counts.index[0]),
         "majority_share": round(largest / total, 4),
         "minority_class": str(counts.index[-1]),
         "minority_count": smallest,
         "minority_share": round(smallest / total, 4),
+        "severity": "warn" if imbalanced else "info",
+        "message": (
+            f"{counts.index[0]} accounts for {largest / total:.0%} of the rows while "
+            f"{counts.index[-1]} has {smallest:,} — a ratio of {ratio:.1f} to 1."
+            if imbalanced
+            else f"Classes are reasonably balanced at {ratio:.1f} to 1."
+        ),
+        "suggestion": (
+            "Judge a model on precision and recall for the rarer class, not on "
+            "accuracy: always answering "
+            f"{counts.index[0]} would already score {largest / total:.0%}."
+            if imbalanced
+            else "No rebalancing needed."
+        ),
         "reason": (
             f"{counts.index[0]} accounts for {largest / total * 100:.0f}% of the rows "
             f"while {counts.index[-1]} has only {smallest:,}. A model that always "
             f"answered {counts.index[0]} would score {largest / total * 100:.0f}% "
             "accuracy while being useless, so judge this one on precision and recall "
             "for the rarer class, not on accuracy."
+            if imbalanced
+            else f"Classes are reasonably balanced at {ratio:.1f}:1."
         ),
     }
 

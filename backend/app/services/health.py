@@ -64,6 +64,37 @@ DIMENSION_LABELS: dict[str, tuple[str, str]] = {
 #: Below this a dimension is called a problem rather than a note.
 _CONCERN = 75.0
 
+#: What to do about a low score, per dimension. A warning that names a problem and
+#: stops leaves the reader to work out the remedy; every issue here carries one.
+_SUGGESTIONS: dict[str, str] = {
+    "completeness": (
+        "Columns over 60% empty are dropped and the rest are imputed from the training "
+        "rows. If a gap means something — 'not applicable' rather than 'unknown' — "
+        "encode that explicitly before uploading."
+    ),
+    "validity": (
+        "Outlying values are reported rather than removed by default. Check whether the "
+        "extremes are real measurements or data-entry errors before deciding."
+    ),
+    "consistency": (
+        "A column that mixes numbers and text usually means a stray note in a numeric "
+        "field. Find those rows and fix them at source; guessing here would lose data."
+    ),
+    "uniqueness": (
+        "Duplicate rows are removed before the split. Columns that never change are "
+        "dropped — they cost width and carry nothing."
+    ),
+    "distribution": (
+        "Skewed columns are candidates for a log or Yeo-Johnson transform, and widely "
+        "differing scales are handled by the scaler. Neither stops a model training."
+    ),
+    "feature_quality": (
+        "Identifier-like and redundant columns are removed. A column flagged as looking "
+        "like the answer is excluded by default — put it back only if you will genuinely "
+        "have it before the outcome is known."
+    ),
+}
+
 
 class HealthReport(dict):
     """The assessment. A dict so it serialises directly, with the score to hand."""
@@ -475,8 +506,15 @@ def assess(df: pd.DataFrame, target: str | None = None) -> HealthReport:
             "dimension": d["key"],
             "label": d["label"],
             "score": d["score"],
+            "message": d["summary"],
+            "suggestion": _SUGGESTIONS[d["key"]],
+            # §2's vocabulary. `critical` is reserved for a dimension so low that a
+            # model will not train, rather than merely train badly.
+            "severity": (
+                "critical" if d["score"] < 35 else "warn" if d["score"] < 55 else "info"
+            ),
+            # Kept so clients reading `text` keep working.
             "text": d["summary"],
-            "severity": "warning" if d["score"] < 55 else "info",
         }
         for d in sorted(dimensions.values(), key=lambda d: d["score"])
         if d["status"] == "concern"

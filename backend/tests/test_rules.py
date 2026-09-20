@@ -301,8 +301,22 @@ def test_a_lopsided_target_is_reported_with_its_ratio() -> None:
     assert balance["minority_class"] == "yes"
 
 
-def test_a_balanced_target_is_not_reported() -> None:
-    assert class_balance(pd.Series(["a"] * 50 + ["b"] * 50)) is None
+def test_a_balanced_target_reports_its_ratio_without_warning() -> None:
+    """The ratio is always available; only the verdict changes.
+
+    Returning None for a balanced target left the interface with nothing to show, so a
+    user could not tell a balanced dataset from one that had not been checked.
+    """
+    balance = class_balance(pd.Series(["a"] * 50 + ["b"] * 50))
+    assert balance is not None
+    assert balance["ratio"] == 1.0
+    assert balance["imbalanced"] is False
+    assert balance["severity"] == "info"
+
+
+def test_a_regression_target_has_no_class_balance() -> None:
+    """A continuous column would otherwise enumerate one 'class' per distinct value."""
+    assert class_balance(pd.Series(range(500))) is None
 
 
 # --------------------------------------------------------------------------------------

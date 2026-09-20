@@ -335,3 +335,109 @@ def test_no_baseline_on_too_few_rows() -> None:
     """A cross-validated score on 12 rows says more about the split than the data."""
     frame = load("tiny")
     assert sanity_baseline(frame[["x"]], frame["y"], "binary classification") is None
+
+
+# --------------------------------------------------------------------------------------
+# Profiling additions from slice 3 (spec §2)
+# --------------------------------------------------------------------------------------
+
+
+def test_every_numeric_column_carries_descriptive_statistics() -> None:
+    from app.services.profile import column_profiles
+
+    frame = load("regression")
+    records = {r["column"]: r for r in column_profiles(frame, target="price")}
+
+    stats = records["area_sqm"]["stats"]
+    assert stats is not None
+    for key in ("count", "mean", "std", "min", "q1", "median", "q3", "max", "skew"):
+        assert key in stats, f"{key} missing from the numeric summary"
+    assert stats["min"] <= stats["q1"] <= stats["median"] <= stats["q3"] <= stats["max"]
+
+
+def test_a_categorical_column_has_no_numeric_statistics() -> None:
+    from app.services.profile import column_profiles
+
+    frame = load("regression")
+    records = {r["column"]: r for r in column_profiles(frame, target="price")}
+    assert records["district"]["stats"] is None
+
+
+def test_numeric_columns_get_histogram_bins() -> None:
+    from app.services.profile import histogram
+
+    frame = load("regression")
+    result = histogram(frame["area_sqm"])
+
+    assert result is not None
+    assert result["kind"] == "numeric"
+    assert len(result["counts"]) == result["bins"]
+    assert len(result["edges"]) == result["bins"] + 1
+    assert sum(result["counts"]) == int(frame["area_sqm"].notna().sum())
+
+
+def test_categorical_columns_get_value_counts_instead() -> None:
+    """Same question — how is this distributed — answered the way the column can."""
+    from app.services.profile import histogram
+
+    result = histogram(load("regression")["district"])
+    assert result is not None
+    assert result["kind"] == "categorical"
+    assert len(result["labels"]) == len(result["counts"])
+
+
+def test_a_constant_column_does_not_break_the_histogram() -> None:
+    from app.services.profile import histogram
+
+    result = histogram(pd.Series([7.0] * 50))
+    assert result is not None
+    assert result["counts"] == [50]
+
+
+def test_top_values_are_reported_for_every_column_kind() -> None:
+    """The most common value of a numeric column is how you notice 40% of it is zero."""
+    from app.services.profile import top_values
+
+    values = top_values(pd.Series([0.0] * 40 + list(range(1, 61))))
+    assert values[0]["value"] == "0.0"
+    assert values[0]["count"] == 40
+    assert 0 < values[0]["share"] <= 1
+
+
+def test_skew_is_flagged_at_the_spec_threshold() -> None:
+    """|skew| > 1, not the 2.0 the health engine had been using."""
+    from app.config import SKEW_THRESHOLD
+    from app.services.profile import numeric_summary
+
+    assert SKEW_THRESHOLD == 1.0
+    heavy = numeric_summary(pd.Series(np.random.default_rng(0).exponential(1, 500)))
+    assert heavy is not None
+    assert heavy["skewed"] is True
+
+    symmetric = numeric_summary(pd.Series(np.random.default_rng(0).normal(0, 1, 500)))
+    assert symmetric is not None
+    assert symmetric["skewed"] is False
+
+
+@pytest.mark.parametrize("fixture", ["high_missing", "id_and_constant", "clean_binary"])
+def test_every_warning_carries_a_suggestion(fixture) -> None:
+    """Spec §2. A warning that names a problem and stops makes the reader guess."""
+    from app.services.ingest import read_upload
+
+    path = fixtures.ensure(fixture)
+    result = read_upload(path.read_bytes(), path.name)
+
+    for issue in result.issues:
+        record = issue.as_dict()
+        assert record["severity"] in ("info", "warn", "critical")
+        assert record["message"].strip()
+        assert record["suggestion"].strip(), f"{record['message']} has no suggestion"
+
+
+def test_health_issues_use_the_spec_severity_vocabulary() -> None:
+    from app.services.health import assess
+
+    report = assess(load("high_missing"), target="target")
+    for issue in report["issues"]:
+        assert issue["severity"] in ("info", "warn", "critical")
+        assert issue["suggestion"].strip()

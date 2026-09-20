@@ -163,8 +163,34 @@ class IngestError(Exception):
 
 @dataclass
 class QualityIssue:
-    severity: str  # "warning" | "info"
-    text: str
+    """A finding about the data, shaped as spec §2 requires.
+
+    ``suggestion`` is not decoration. A warning that names a problem and stops leaves
+    the reader to work out what to do, and the whole point of this application is that
+    it does not make people guess. Every issue raised here says what to do about it.
+
+    Severity is ``info`` | ``warn`` | ``critical``, and the three mean different things:
+    ``info`` is worth knowing, ``warn`` will degrade a model, ``critical`` will stop one
+    training at all.
+    """
+
+    severity: str
+    message: str
+    suggestion: str
+
+    @property
+    def text(self) -> str:
+        """Backwards-compatible alias; the field was called ``text`` before §2."""
+        return self.message
+
+    def as_dict(self) -> dict[str, str]:
+        return {
+            "severity": self.severity,
+            "message": self.message,
+            "suggestion": self.suggestion,
+            # Kept so older clients reading `text` keep working.
+            "text": self.message,
+        }
 
 
 @dataclass
@@ -493,19 +519,20 @@ def _score_quality(
         share = duplicates / max(n_rows, 1)
         score -= deduct("duplicate_rows", share * 100, "duplicate rows")
         issues.append(QualityIssue(
-            "warning",
-            f"{_plural(duplicates, 'row is', 'rows are')} an exact duplicate of another row"
-            if duplicates == 1
-            else f"{duplicates:,} rows are exact duplicates of another row",
+            "warn",
+            f"{duplicates:,} row(s) are exact duplicates of another row.",
+            "They are removed before the split. Left in, a repeated row is counted "
+            "twice when the model fits and its copies can land in both folds.",
         ))
 
     empty_columns = [c for c in df.columns if df[c].isna().all()]
     if empty_columns:
         score -= deduct("empty_columns", len(empty_columns), "completely empty columns")
         issues.append(QualityIssue(
-            "warning",
-            f"{_plural(len(empty_columns), 'column is', 'columns are')} completely empty: "
-            + ", ".join(empty_columns[:4]),
+            "warn",
+            f"{len(empty_columns)} column(s) are completely empty: "
+            + ", ".join(empty_columns[:4]) + ".",
+            "They are dropped — there is nothing in them to impute from.",
         ))
 
     very_sparse = [
@@ -514,9 +541,11 @@ def _score_quality(
     if very_sparse:
         score -= deduct("sparse_columns", len(very_sparse), "mostly empty columns")
         issues.append(QualityIssue(
-            "warning",
-            f"{_plural(len(very_sparse), 'column is', 'columns are')} more than "
-            f"{MAX_MISSING_RATE * 100:.0f}% empty: " + ", ".join(very_sparse[:4]),
+            "warn",
+            f"{len(very_sparse)} column(s) are more than "
+            f"{MAX_MISSING_RATE:.0%} empty: " + ", ".join(very_sparse[:4]) + ".",
+            "These are dropped rather than filled: past this point the column would "
+            "record our fill value more than it records your data.",
         ))
 
     if leakage_flags:
@@ -525,7 +554,10 @@ def _score_quality(
     if missing_rate > MISSING_MENTION_RATE:
         issues.append(QualityIssue(
             "info",
-            f"{missing_rate * 100:.1f}% of all cells are blank — these get filled in later",
+            f"{missing_rate:.1%} of all cells are blank.",
+            "They are filled from the training rows only, and a missing-value indicator "
+            "is added for any column over 5% empty so the model can tell a filled value "
+            "from a real one.",
         ))
 
     if n_rows < SMALL_SAMPLE_ROWS:
@@ -540,7 +572,9 @@ def _score_quality(
         })
         issues.append(QualityIssue(
             "info",
-            f"{n_rows} rows is a small sample, so results will be rough",
+            f"{n_rows:,} rows is a small sample.",
+            "A 20% holdout leaves few rows to score against, so treat any result as "
+            "indicative rather than measured.",
         ))
 
     return max(min(int(round(score)), 100), 0), issues, breakdown

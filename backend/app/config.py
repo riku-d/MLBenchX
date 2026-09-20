@@ -47,9 +47,13 @@ __all__ = [
     "MIN_ROWS_FOR_BASELINE",
     "MIN_ROWS_FOR_DRIFT",
     "OUTLIER_IQR_MULTIPLIER",
+    "HISTOGRAM_BINS",
+    "TOP_VALUES",
+    "SKEW_THRESHOLD",
     "IMBALANCE_RATIO",
     "MAX_TARGET_CLASSES",
     "MAX_TARGET_CARDINALITY",
+    "MAX_CLASSES_LISTED",
     "TEST_SIZE",
     "SEED",
     "DEFAULT_SCALER",
@@ -202,6 +206,18 @@ MIN_ROWS_FOR_CORRELATION = _int("MIN_ROWS_FOR_CORRELATION", 30)
 #: it is reported, never acted on.
 OUTLIER_IQR_MULTIPLIER = _float("OUTLIER_IQR_MULTIPLIER", 1.5)
 
+#: Bins in a numeric column's histogram. Twenty is enough to show shape — bimodality,
+#: a spike at zero, a long tail — without turning a few hundred rows into noise.
+HISTOGRAM_BINS = _int("HISTOGRAM_BINS", 20)
+
+#: How many of the most frequent values to report per column.
+TOP_VALUES = _int("TOP_VALUES", 5)
+
+#: |skew| above this marks a column as one-sided enough to be worth transforming. The
+#: spec's figure. Below it, a log transform usually costs more interpretability than it
+#: buys in symmetry.
+SKEW_THRESHOLD = _float("SKEW_THRESHOLD", 1.0)
+
 #: Class imbalance is reported when the largest class is at least this many times the
 #: smallest. At 3:1 accuracy starts to flatter a model that always guesses the majority.
 IMBALANCE_RATIO = _float("IMBALANCE_RATIO", 3.0)
@@ -209,6 +225,11 @@ IMBALANCE_RATIO = _float("IMBALANCE_RATIO", 3.0)
 #: A numeric target with more distinct values than this is a regression rather than a
 #: many-class classification.
 MAX_TARGET_CLASSES = _int("MAX_TARGET_CLASSES", 20)
+
+#: How many classes to enumerate in a balance report. The interface renders these as a
+#: list, so an unbounded one would push everything else off the screen; the true count
+#: is reported alongside, so this elides rather than hides.
+MAX_CLASSES_LISTED = _int("MAX_CLASSES_LISTED", 12)
 
 #: A non-numeric target with more distinct values than this is a label or free-text
 #: field, not an outcome, and is refused with an explanation.
