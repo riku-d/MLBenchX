@@ -28,6 +28,7 @@ import pandas as pd
 from charset_normalizer import from_bytes
 
 from app.config import (
+    DATE_PARSE_RATE,
     HEALTH_WEIGHTS,
     MAX_MISSING_RATE,
     MIN_ROWS,
@@ -52,6 +53,103 @@ _PARQUET_SUFFIXES = (".parquet", ".pq")
 #: Currency symbols, thousands separators and stray percent signs that stop pandas from
 #: seeing a number. Stripped only when doing so makes the whole column numeric.
 _NUMERIC_NOISE = re.compile(r"[,\s ₹$€£%]")
+
+
+#: Leading bytes that identify a file regardless of what it was named. Checking these
+#: is the difference between "the extension says CSV" and "this is CSV": an extension
+#: is a claim by whoever uploaded the file, and the parser is the wrong place to find
+#: out it was false.
+_MAGIC: tuple[tuple[bytes, str], ...] = (
+    (b"PK\x03\x04", "zip"),        # xlsx, and every other zip container
+    (b"PAR1", "parquet"),
+    (b"\x7fELF", "executable"),
+    (b"MZ", "executable"),
+    (b"\xca\xfe\xba\xbe", "executable"),
+    (b"\xcf\xfa\xed\xfe", "executable"),
+    (b"%PDF", "pdf"),
+    (b"\x89PNG", "image"),
+    (b"\xff\xd8\xff", "image"),
+    (b"GIF8", "image"),
+    (b"\x1f\x8b", "gzip"),
+    (b"SQLite format 3", "database"),
+)
+
+#: Formats we can actually read, and what a file of that kind should look like.
+_EXPECTED_MAGIC = {
+    "spreadsheet": "zip",
+    "parquet": "parquet",
+}
+
+
+def _sniff(raw: bytes) -> str:
+    """What this file actually is, from its leading bytes."""
+    for signature, kind in _MAGIC:
+        if raw.startswith(signature):
+            return kind
+    # Text is identified by exclusion rather than by a signature: a CSV has none. A NUL
+    # byte in the first chunk is the reliable tell that it is not text at all.
+    if b"\x00" in raw[:8192]:
+        return "binary"
+    return "text"
+
+
+def _check_content(raw: bytes, filename: str) -> None:
+    """Refuse a file whose contents contradict its name.
+
+    An extension check alone accepts anything renamed to ``.csv``. This is not much of
+    a security boundary on its own — the parser would reject most of it eventually —
+    but "that is a PDF, not a spreadsheet" is a far better answer than a pandas
+    traceback, and it stops the parser being the first thing to touch hostile input.
+    """
+    lowered = filename.lower()
+    actual = _sniff(raw)
+
+    if lowered.endswith(_SPREADSHEET_SUFFIXES):
+        expected = _EXPECTED_MAGIC["spreadsheet"]
+        if actual != expected:
+            raise IngestError(
+                f"That file is named like a spreadsheet but its contents are not one "
+                f"({_describe(actual)}). Open it and save a copy as .xlsx or .csv."
+            )
+        return
+
+    if lowered.endswith(_PARQUET_SUFFIXES):
+        if actual != "parquet":
+            raise IngestError(
+                f"That file is named like Parquet but its contents are not "
+                f"({_describe(actual)})."
+            )
+        return
+
+    if lowered.endswith(_TEXT_SUFFIXES + _JSON_SUFFIXES):
+        if actual != "text":
+            raise IngestError(
+                f"That file is named like a text table but it is {_describe(actual)}. "
+                "Upload a CSV, TSV, Excel, JSON or Parquet file."
+            )
+        return
+
+    # An extension we do not claim to read at all. Say that, rather than commenting on
+    # the contents: "we cannot read .png files" is the useful answer, and "that .png is
+    # an image" is merely true.
+    raise IngestError(
+        "We can read CSV, TSV, Excel, JSON and Parquet files. That one has a different "
+        "extension — open it and save a copy as CSV."
+    )
+
+
+def _describe(kind: str) -> str:
+    return {
+        "zip": "a zip archive",
+        "parquet": "a Parquet file",
+        "executable": "an executable",
+        "pdf": "a PDF",
+        "image": "an image",
+        "gzip": "a gzip archive",
+        "database": "a SQLite database",
+        "binary": "binary data",
+        "text": "text",
+    }.get(kind, kind)
 
 
 def _plural(n: int, singular: str, plural: str | None = None) -> str:
@@ -92,6 +190,16 @@ class IngestResult:
     numeric_columns: list[str] = field(default_factory=list)
     #: Columns that were stored as text and recognised as dates, for the same reason.
     datetime_columns: list[str] = field(default_factory=list)
+    #: Columns recognised as true/false answers.
+    boolean_columns: list[str] = field(default_factory=list)
+    #: ``{original heading: cleaned heading}``. Every message names a column, and a user
+    #: who uploaded " Total Revenue " needs to see the name they typed.
+    column_mapping: dict[str, str | list[str]] = field(default_factory=dict)
+    #: Which sheet was read, and which were available. Empty for non-spreadsheets.
+    sheet_name: str | None = None
+    available_sheets: list[str] = field(default_factory=list)
+    #: Values in a date column that could not be parsed and became blanks.
+    unparsed_dates: dict[str, int] = field(default_factory=dict)
 
 
 # --------------------------------------------------------------------------------------
@@ -199,7 +307,7 @@ _DATE_SHAPED = re.compile(
 )
 
 
-def _coerce_datetime(df: pd.DataFrame) -> list[str]:
+def _coerce_datetime(df: pd.DataFrame, unparsed: dict[str, int] | None = None) -> list[str]:
     """Convert text columns that are really dates.
 
     Without this the calendar features never run on an uploaded file: a CSV has no
@@ -214,6 +322,7 @@ def _coerce_datetime(df: pd.DataFrame) -> list[str]:
     encoded-column list still reports.
     """
     converted: list[str] = []
+    unparsed = {} if unparsed is None else unparsed
     for column in df.columns:
         series = df[column]
         if series.dtype != object:
@@ -223,36 +332,101 @@ def _coerce_datetime(df: pd.DataFrame) -> list[str]:
             continue
 
         as_text = non_null.astype("string")
-        if not as_text.str.match(_DATE_SHAPED).all():
+        shaped = as_text.str.match(_DATE_SHAPED)
+        if float(shaped.mean()) < DATE_PARSE_RATE:
             continue
 
         parsed = pd.to_datetime(series, errors="coerce", format="mixed", dayfirst=False)
-        # Every value that had something in it must have parsed, or this is not a date
-        # column and we would be turning real values into blanks.
-        if int(parsed.isna().sum()) != int(series.isna().sum()):
+        # The spec's rule is a *rate*, not unanimity: a column where 95% of values are
+        # dates and the rest are "N/A" or a stray note is a date column with some bad
+        # rows, and refusing to parse it because of those rows leaves the whole thing as
+        # text. The unparsed values become blanks, which the missing-value step then
+        # handles and reports — so nothing is lost silently.
+        parsed_rate = float(parsed.notna().sum()) / max(int(series.notna().sum()), 1)
+        if parsed_rate < DATE_PARSE_RATE:
             continue
 
+        lost = int(series.notna().sum()) - int(parsed.notna().sum())
         df[column] = parsed
+        converted.append(str(column))
+        if lost:
+            unparsed[str(column)] = lost
+    return converted
+
+
+#: Spellings people use for true and false. Compared case-insensitively after stripping.
+#: Deliberately does not include ``1``/``0``: those are already numbers, and a column of
+#: them is as likely to be a count or a code as a flag.
+_TRUE_TOKENS = frozenset({"true", "yes", "y", "t"})
+_FALSE_TOKENS = frozenset({"false", "no", "n", "f"})
+
+
+def _coerce_boolean(df: pd.DataFrame) -> list[str]:
+    """Convert text columns that hold a yes/no answer.
+
+    Only when *every* non-blank value is one of the known spellings, and both a true and
+    a false appear. Requiring both matters: a column that is entirely ``"Y"`` is a
+    constant, and turning it into ``True`` would disguise that as a usable boolean.
+    """
+    converted: list[str] = []
+    for column in df.columns:
+        series = df[column]
+        if series.dtype != object:
+            continue
+        values = series.dropna()
+        if values.empty:
+            continue
+
+        lowered = values.astype("string").str.strip().str.lower()
+        if not lowered.isin(_TRUE_TOKENS | _FALSE_TOKENS).all():
+            continue
+        if not (lowered.isin(_TRUE_TOKENS).any() and lowered.isin(_FALSE_TOKENS).any()):
+            continue
+
+        mapped = (
+            series.astype("string").str.strip().str.lower().map(
+                lambda v: True if v in _TRUE_TOKENS else (False if v in _FALSE_TOKENS else pd.NA)
+            )
+        )
+        df[column] = mapped.astype("boolean")
         converted.append(str(column))
     return converted
 
 
-def _tidy_headers(df: pd.DataFrame) -> int:
-    """Strip whitespace from column names and give unnamed columns a stable label."""
+def _tidy_headers(df: pd.DataFrame) -> tuple[int, dict[str, str | list[str]]]:
+    """Strip whitespace from column names, name the unnamed, and disambiguate repeats.
+
+    Returns the number of names changed and the ``{original: clean}`` mapping.
+
+    The mapping is not bookkeeping. Every message this app shows names a column, and a
+    user who uploaded ``" Total Revenue "`` needs to see that name, not ``Total
+    Revenue`` — otherwise they go looking in their spreadsheet for a column that is not
+    there. It is also the only record of which of two identically-named columns became
+    ``region`` and which became ``region_1``, which is unrecoverable once it is lost.
+    """
     renamed = 0
+    mapping: dict[str, str] = {}
     new_names: list[str] = []
-    for position, name in enumerate(df.columns):
-        text = str(name).strip()
+
+    # Prefer the headings as the file wrote them, when the reader preserved them.
+    written = df.attrs.get("raw_headers")
+    source = [str(h) for h in written] if written and len(written) == df.shape[1] else [
+        str(c) for c in df.columns
+    ]
+
+    for position, name in enumerate(source):
+        original = str(name)
+        text = original.strip()
         if not text or text.lower().startswith("unnamed:"):
             text = f"column_{position + 1}"
-        if text != str(name):
+        if text != original:
             renamed += 1
         new_names.append(text)
 
     # Disambiguate duplicates so downstream column lookups stay unambiguous.
     seen: dict[str, int] = {}
     final: list[str] = []
-    for text in new_names:
+    for original, text in zip(source, new_names):
         if text in seen:
             seen[text] += 1
             text = f"{text}_{seen[text]}"
@@ -260,9 +434,15 @@ def _tidy_headers(df: pd.DataFrame) -> int:
         else:
             seen[text] = 0
         final.append(text)
+        # A heading written twice maps to both cleaned names, so the record is a list.
+        mapping.setdefault(str(original), [])
+        mapping[str(original)].append(text)
 
     df.columns = final
-    return renamed
+    # Collapse the common case — one original, one clean name — back to a plain string,
+    # so callers are not forced to unwrap a list for every ordinary column.
+    collapsed = {k: (v[0] if len(v) == 1 else v) for k, v in mapping.items()}
+    return renamed, collapsed
 
 
 # --------------------------------------------------------------------------------------
@@ -371,6 +551,32 @@ def _score_quality(
 # --------------------------------------------------------------------------------------
 
 
+def _looks_headerless(columns: list[str]) -> bool:
+    """Whether the first row of this file was data rather than names.
+
+    A CSV has no way to say "there is no header", so pandas takes the first row as one
+    regardless. Accepting that silently costs the user an observation *and* gives every
+    column a name that is really a value — and the damage is invisible, because the file
+    loads and looks plausible.
+
+    The test is that *every* header parses as a number. Requiring all of them keeps a
+    real file safe: a spreadsheet with a column honestly called ``2024`` alongside
+    ``region`` and ``revenue`` is not headerless, and a single numeric name is common.
+    A row that is entirely numbers is not a set of names anybody wrote.
+    """
+    if len(columns) < 2:
+        return False
+    for name in columns:
+        text = str(name).strip()
+        # Pandas suffixes repeated headers, so "3" twice arrives as "3" and "3.1".
+        text = text.rsplit(".", 1)[0] if text.count(".") == 1 and text.replace(".", "").isdigit() else text
+        try:
+            float(text)
+        except ValueError:
+            return False
+    return True
+
+
 def _read_json(raw: bytes, filename: str) -> pd.DataFrame:
     """Read a JSON dataset, accepting the three shapes people actually export.
 
@@ -440,7 +646,64 @@ def _read_parquet(raw: bytes) -> pd.DataFrame:
         ) from exc
 
 
-def _read_frame(raw: bytes, filename: str) -> tuple[pd.DataFrame, str, str]:
+def list_sheets(raw: bytes) -> list[str]:
+    """Sheet names in a workbook, in the order they appear in it."""
+    try:
+        with pd.ExcelFile(io.BytesIO(raw)) as workbook:
+            return [str(name) for name in workbook.sheet_names]
+    except Exception as exc:  # noqa: BLE001
+        raise IngestError(
+            "We couldn't open that spreadsheet. If it was exported from another "
+            "program, try saving it again as CSV."
+        ) from exc
+
+
+def _read_excel(raw: bytes, sheet_name: str | None) -> tuple[pd.DataFrame, str, str]:
+    """One sheet of a workbook — the named one, or the first.
+
+    Naming a sheet that is not there is refused with the list of ones that are, rather
+    than silently falling back to the first. A user who asked for "2024 Actuals" and got
+    "Template" would not necessarily notice, and every number they then saw would be
+    from the wrong sheet.
+    """
+    sheets = list_sheets(raw)
+    if not sheets:
+        raise IngestError("That workbook has no sheets in it.")
+
+    chosen = sheets[0] if sheet_name is None else sheet_name
+    if chosen not in sheets:
+        available = ", ".join(sheets[:8])
+        raise IngestError(
+            f"That workbook has no sheet called {chosen!r}. It contains: {available}."
+        )
+
+    try:
+        frame = pd.read_excel(io.BytesIO(raw), sheet_name=chosen)
+    except Exception as exc:  # noqa: BLE001 - surfaced to the user as a sentence
+        raise IngestError(
+            f"We couldn't read the sheet {chosen!r}. Try saving it again as CSV."
+        ) from exc
+    return frame, "n/a (spreadsheet)", f"sheet: {chosen}"
+
+
+def _raw_headers(text: str, delimiter: str) -> list[str]:
+    """The header line exactly as the file wrote it.
+
+    Needed because pandas resolves duplicate headings while reading — a file with two
+    ``région`` columns arrives as ``région`` and ``région.1``, and by then the fact that
+    both were written the same is gone. A mapping built from what pandas handed us would
+    record ``région.1 -> région.1``, which is true of nothing the user ever saw.
+    """
+    first = text.splitlines()[0] if text.splitlines() else ""
+    try:
+        return next(csv.reader([first], delimiter=delimiter))
+    except (csv.Error, StopIteration):
+        return [cell for cell in first.split(delimiter)]
+
+
+def _read_frame(
+    raw: bytes, filename: str, sheet_name: str | None = None
+) -> tuple[pd.DataFrame, str, str]:
     """Parse the bytes into a frame, returning it with the detected encoding/delimiter."""
     lowered = filename.lower()
 
@@ -451,14 +714,7 @@ def _read_frame(raw: bytes, filename: str) -> tuple[pd.DataFrame, str, str]:
         return _read_json(raw, filename), "utf-8", "n/a (json)"
 
     if lowered.endswith(_SPREADSHEET_SUFFIXES):
-        try:
-            frame = pd.read_excel(io.BytesIO(raw))
-        except Exception as exc:  # noqa: BLE001 - surfaced to the user as a sentence
-            raise IngestError(
-                "We couldn't open that spreadsheet. If it was exported from another "
-                "program, try saving it again as CSV."
-            ) from exc
-        return frame, "n/a (spreadsheet)", "n/a (spreadsheet)"
+        return _read_excel(raw, sheet_name)
 
     if not lowered.endswith(_TEXT_SUFFIXES):
         raise IngestError(
@@ -484,15 +740,23 @@ def _read_frame(raw: bytes, filename: str) -> tuple[pd.DataFrame, str, str]:
             "We couldn't make sense of the rows in that file. Check that every row has "
             "the same number of columns."
         ) from exc
+
+    # Stash the headings as written, before pandas' de-duplication is the only record.
+    originals = _raw_headers(text, delimiter)
+    if len(originals) == frame.shape[1]:
+        frame.attrs["raw_headers"] = originals
     return frame, encoding, delimiter
 
 
-def read_upload(raw: bytes, filename: str) -> IngestResult:
+def read_upload(
+    raw: bytes, filename: str, sheet_name: str | None = None
+) -> IngestResult:
     """Read an uploaded file into a clean frame, recording every repair.
 
     Args:
         raw: the uploaded bytes.
-        filename: used only to pick a parser and to echo back to the user.
+        filename: picks a parser, and is echoed back to the user.
+        sheet_name: which sheet of a workbook to read. ``None`` means the first.
 
     Raises:
         IngestError: with a message written for the user, not for a log file.
@@ -500,10 +764,20 @@ def read_upload(raw: bytes, filename: str) -> IngestResult:
     if not raw:
         raise IngestError("That file is empty. Upload a spreadsheet with some rows in it.")
 
-    frame, encoding, delimiter = _read_frame(raw, filename)
+    # What the file *is*, before the parser is allowed near it.
+    _check_content(raw, filename)
+
+    frame, encoding, delimiter = _read_frame(raw, filename, sheet_name)
     cleaning: list[str] = []
 
-    renamed = _tidy_headers(frame)
+    if _looks_headerless(list(frame.columns)):
+        raise IngestError(
+            "That file has no header row — the first line is already data, so every "
+            "column would be named after a value and that first observation would be "
+            "lost. Add a row of column names and upload it again."
+        )
+
+    renamed, column_mapping = _tidy_headers(frame)
     if renamed:
         cleaning.append(
             f"Tidied up {_plural(renamed, 'column heading')} with stray spaces or no name"
@@ -543,12 +817,27 @@ def read_upload(raw: bytes, filename: str) -> IngestResult:
             f"numbers: {shown}"
         )
 
-    dates = _coerce_datetime(frame)
+    unparsed_dates: dict[str, int] = {}
+    dates = _coerce_datetime(frame, unparsed_dates)
     if dates:
         shown = ", ".join(dates[:4]) + (" and others" if len(dates) > 4 else "")
         cleaning.append(
             f"Recognised {_plural(len(dates), 'column')} as dates rather than text: "
             f"{shown}"
+        )
+    if unparsed_dates:
+        total = sum(unparsed_dates.values())
+        named = ", ".join(f"{c} ({n})" for c, n in list(unparsed_dates.items())[:3])
+        cleaning.append(
+            f"Left {_plural(total, 'value')} blank in the date columns because they "
+            f"could not be read as a date: {named}"
+        )
+
+    booleans = _coerce_boolean(frame)
+    if booleans:
+        shown = ", ".join(booleans[:4]) + (" and others" if len(booleans) > 4 else "")
+        cleaning.append(
+            f"Recognised {_plural(len(booleans), 'column')} as true/false answers: {shown}"
         )
 
     if len(frame) < MIN_ROWS:
@@ -579,6 +868,13 @@ def read_upload(raw: bytes, filename: str) -> IngestResult:
         quality_breakdown=breakdown,
         numeric_columns=converted,
         datetime_columns=dates,
+        boolean_columns=booleans,
+        column_mapping=column_mapping,
+        sheet_name=sheet_name,
+        available_sheets=(
+            list_sheets(raw) if filename.lower().endswith(_SPREADSHEET_SUFFIXES) else []
+        ),
+        unparsed_dates=unparsed_dates,
     )
 
 

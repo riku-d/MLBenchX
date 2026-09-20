@@ -97,6 +97,7 @@ from app.config import (
     DEFAULT_SCALER,
     MAX_COLUMNS_IN_EXPLANATION,
     MAX_MISSING_RATE,
+    NEAR_CONSTANT_SHARE,
     ONEHOT_MAX_CARDINALITY,
     SEED,
     TARGET_ENCODER_CV,
@@ -171,9 +172,22 @@ class ColumnProfile:
     unique_rate: float
 
 
+def _top_share(series: pd.Series) -> float:
+    """Share of the non-blank values taken by the most common one."""
+    values = series.dropna()
+    if values.empty:
+        return 0.0
+    return float(values.value_counts(normalize=True).iloc[0])
+
+
 def _classify(series: pd.Series, n_unique: int, unique_rate: float) -> str:
     """Assign a ``kind`` to one column. Rules are applied in this order, first match wins."""
     if n_unique <= 1:
+        return "constant"
+    # Near-constant counts as constant. A column that is 99.5% one value carries almost
+    # nothing, and treating it as an ordinary category spends a one-hot column — or a
+    # whole encoder — on a distinction that occurs twice in a thousand rows.
+    if _top_share(series) >= NEAR_CONSTANT_SHARE:
         return "constant"
     if pd.api.types.is_bool_dtype(series):
         # Booleans are numeric to numpy but behave like two-level categories.
@@ -602,7 +616,15 @@ def build_plan(
             plan.dropped[name] = f"{_pct(profile.missing_rate)} of values are missing"
             continue
         if profile.kind == "constant":
-            plan.dropped[name] = "constant — a single value carries no information"
+            plan.dropped[name] = (
+                "constant — a single value carries no information"
+                if profile.n_unique <= 1
+                else (
+                    f"near-constant — one value covers "
+                    f"{NEAR_CONSTANT_SHARE:.0%} or more of the rows, so the column "
+                    "barely varies"
+                )
+            )
             continue
         if profile.kind == "text":
             plan.dropped[name] = (

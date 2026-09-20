@@ -90,8 +90,10 @@ def test_bad_files_raise_a_sentence_the_user_can_act_on(payload, name, fragment)
 
 
 def test_an_unsupported_extension_is_refused_helpfully() -> None:
+    """An extension we do not read at all gets the useful answer — which formats we do
+    read — rather than a remark about the file's contents."""
     with pytest.raises(IngestError, match="save a copy as CSV"):
-        read_upload(b"\x00\x01binary", "photo.png")
+        read_upload(b"\x89PNG\r\n\x1a\n", "photo.png")
 
 
 # --------------------------------------------------------------------------------------

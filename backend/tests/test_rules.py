@@ -531,6 +531,8 @@ def test_parquet_is_read(titanic) -> None:
         ("scalar.json", b"42", "single value"),
         ("broken.parquet", b"not a parquet file at all", "Parquet"),
         ("notes.pdf", b"%PDF-1.4", "different extension"),
+        # A PDF wearing a .csv name is caught by its contents, not its extension.
+        ("disguised.csv", b"%PDF-1.4", "it is a PDF"),
     ],
 )
 def test_an_unreadable_file_is_refused_with_a_sentence(name, payload, fragment) -> None:
@@ -539,3 +541,162 @@ def test_an_unreadable_file_is_refused_with_a_sentence(name, payload, fragment) 
     with pytest.raises(IngestError) as caught:
         read_upload(payload, name)
     assert fragment in str(caught.value)
+
+
+# --------------------------------------------------------------------------------------
+# Ingestion rules added in slice 2 (spec §1)
+# --------------------------------------------------------------------------------------
+
+
+def _read(name: str, **kwargs):
+    from app.services.ingest import read_upload
+    from tests.fixtures import generate as fixtures
+
+    path = fixtures.ensure(name)
+    return read_upload(path.read_bytes(), path.name, **kwargs)
+
+
+@pytest.mark.parametrize(
+    "payload,name,fragment",
+    [
+        (b"\x7fELF\x02\x01", "data.csv", "an executable"),
+        (b"%PDF-1.4", "data.csv", "a PDF"),
+        (b"\x89PNG\r\n", "data.csv", "an image"),
+        (b"SQLite format 3\x00", "data.csv", "a SQLite database"),
+        (b"not a zip at all", "book.xlsx", "contents are not one"),
+        (b"not parquet", "data.parquet", "contents are not"),
+    ],
+)
+def test_content_is_checked_not_just_the_extension(payload, name, fragment) -> None:
+    """Spec §7. An extension is a claim by whoever uploaded the file."""
+    from app.services.ingest import IngestError, read_upload
+
+    with pytest.raises(IngestError, match=fragment):
+        read_upload(payload, name)
+
+
+def test_a_headerless_file_is_refused() -> None:
+    """Accepting it costs an observation and names every column after a value."""
+    from app.services.ingest import IngestError
+
+    with pytest.raises(IngestError, match="no header row"):
+        _read("headerless.csv")
+
+
+def test_a_numeric_column_name_does_not_make_a_file_headerless() -> None:
+    """A spreadsheet with a column honestly called 2024 is not headerless.
+
+    The rule requires *every* heading to be numeric, which is what keeps this safe.
+    """
+    from app.services.ingest import read_upload
+
+    csv = "region,2024,revenue\n" + "\n".join(f"north,{i},{i * 10}" for i in range(80))
+    result = read_upload(csv.encode(), "sales.csv")
+    assert list(result.frame.columns) == ["region", "2024", "revenue"]
+
+
+@pytest.mark.parametrize(
+    "values,expected",
+    [
+        (["yes", "no"], True),
+        (["Y", "N"], True),
+        (["TRUE", "false"], True),
+        (["t", "f"], True),
+        (["yes", "maybe"], False),      # not every value is a known spelling
+        (["yes", "yes"], False),        # constant; calling it boolean hides that
+        (["1", "0"], False),            # already numbers, and as likely a code
+    ],
+)
+def test_boolean_coercion(values, expected) -> None:
+    from app.services.ingest import read_upload
+
+    n = 80
+    csv = "flag,pad\n" + "\n".join(
+        f"{values[i % len(values)]},{i}" for i in range(n)
+    )
+    result = read_upload(csv.encode(), "t.csv")
+    is_boolean = pd.api.types.is_bool_dtype(result.frame["flag"])
+    assert is_boolean is expected
+
+
+def test_dates_parse_at_ninety_percent_not_only_at_a_hundred() -> None:
+    """Spec §1. Refusing a column because 5% of it is junk leaves all of it as text."""
+    from app.services.ingest import read_upload
+
+    good = [f"2024-{(i % 12) + 1:02d}-05" for i in range(95)]
+    bad = ["not a date"] * 5
+    csv = "when,pad\n" + "\n".join(f"{v},{i}" for i, v in enumerate(good + bad))
+
+    result = read_upload(csv.encode(), "t.csv")
+
+    assert pd.api.types.is_datetime64_any_dtype(result.frame["when"])
+    assert "when" in result.datetime_columns
+    # The rows that could not be read became blanks, and that is reported rather than
+    # quietly absorbed.
+    assert result.unparsed_dates["when"] == 5
+    assert any("could not be read as a date" in line for line in result.cleaning)
+
+
+def test_a_column_below_the_date_rate_stays_text() -> None:
+    from app.services.ingest import read_upload
+
+    good = [f"2024-{(i % 12) + 1:02d}-05" for i in range(70)]
+    bad = ["not a date"] * 30
+    csv = "when,pad\n" + "\n".join(f"{v},{i}" for i, v in enumerate(good + bad))
+
+    result = read_upload(csv.encode(), "t.csv")
+    assert result.frame["when"].dtype == object
+
+
+def test_the_original_to_clean_header_mapping_is_kept() -> None:
+    """Spec §1. Every message names a column; it must be the name the user typed."""
+    result = _read("unicode_duplicate_headers.csv")
+
+    mapping = result.column_mapping
+    # A heading written twice maps to both cleaned names.
+    assert mapping["région"] == ["région", "région_1"]
+    # Whitespace is preserved on the left of the mapping and stripped on the right.
+    assert mapping[" naïve  "] == "naïve"
+
+
+@pytest.mark.parametrize("sheet,rows", [(None, 600), ("first", 600), ("second", 500)])
+def test_a_workbook_sheet_can_be_chosen(sheet, rows) -> None:
+    result = _read("two_sheets.xlsx", sheet_name=sheet)
+    assert result.rows == rows
+    assert result.available_sheets == ["first", "second"]
+
+
+def test_asking_for_a_sheet_that_is_not_there_lists_the_ones_that_are() -> None:
+    """Falling back to the first sheet silently would show numbers from the wrong one."""
+    from app.services.ingest import IngestError
+
+    with pytest.raises(IngestError, match="first, second"):
+        _read("two_sheets.xlsx", sheet_name="Q3 Actuals")
+
+
+def test_a_near_constant_column_is_treated_as_constant() -> None:
+    """Spec §1. 99.4% one value carries almost nothing but costs a whole encoder."""
+    from app.services.glassbox import profile_frame
+
+    frame = pd.read_csv(_fixture_path("id_and_constant"))
+    kinds = {name: profile.kind for name, profile in profile_frame(frame).items()}
+    assert kinds["near_constant"] == "constant"
+    assert kinds["country"] == "constant"
+    assert kinds["score"] == "numeric"
+
+
+def _fixture_path(name: str):
+    from tests.fixtures import generate as fixtures
+
+    return fixtures.ensure(name)
+
+
+def test_an_identifier_column_is_caught_at_the_spec_threshold() -> None:
+    """Spec §1 puts the bar at 0.95 unique; it had been set at 0.98."""
+    from app.services.screening import find_identifier_columns
+
+    frame = pd.read_csv(_fixture_path("id_and_constant"))
+    found = find_identifier_columns(frame, target="target")
+    assert "record_id" in found
+    assert "reference_no" in found
+    assert "score" not in found

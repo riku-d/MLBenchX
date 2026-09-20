@@ -28,6 +28,8 @@ __all__ = [
     "MIN_ROWS",
     "UPLOAD_CHUNK_BYTES",
     "MISSING_TOKENS",
+    "DATE_PARSE_RATE",
+    "NEAR_CONSTANT_SHARE",
     "ONEHOT_MAX_CARDINALITY",
     "MAX_MISSING_RATE",
     "TEXT_UNIQUE_RATE",
@@ -99,6 +101,16 @@ UPLOAD_CHUNK_BYTES = _int("UPLOAD_CHUNK_BYTES", 1024 * 1024)
 #: of 40 rows is 8 rows, and any score computed on 8 rows is noise.
 MIN_ROWS = _int("MIN_ROWS", 50)
 
+#: Share of a text column's non-blank values that must parse as dates before the column
+#: is treated as one. The spec's rule is a rate rather than unanimity: a column where
+#: 95% of values are dates and the rest are stray notes is a date column with some bad
+#: rows, and leaving the whole thing as text because of them loses more than it saves.
+DATE_PARSE_RATE = _float("DATE_PARSE_RATE", 0.90)
+
+#: A column whose most common value occupies at least this share is near-constant. It
+#: carries almost nothing and costs a column's width and the reader's attention.
+NEAR_CONSTANT_SHARE = _float("NEAR_CONSTANT_SHARE", 0.99)
+
 #: Strings people type when they mean "no value". Compared case-insensitively after
 #: stripping surrounding whitespace.
 MISSING_TOKENS: frozenset[str] = frozenset({
@@ -130,7 +142,7 @@ TEXT_MIN_UNIQUE = _int("TEXT_MIN_UNIQUE", 50)
 
 #: A column this close to entirely distinct identifies the row, whatever its dtype. Set
 #: high on purpose: a genuine measurement like income can be 60% distinct.
-IDENTIFIER_UNIQUE_RATE = _float("IDENTIFIER_UNIQUE_RATE", 0.98)
+IDENTIFIER_UNIQUE_RATE = _float("IDENTIFIER_UNIQUE_RATE", 0.95)
 
 #: A weaker bar applies when the column is *named* like a key — ``student_id``,
 #: ``ref_no``. The name is evidence, so less uniqueness is needed to convict.
