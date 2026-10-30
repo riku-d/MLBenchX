@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import io
 import json
+import logging
 import uuid
 import zipfile
 from datetime import datetime, timezone
@@ -33,9 +34,10 @@ from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import PlainTextResponse, Response
 from pydantic import BaseModel, Field
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from app.codegen import explain_step, generate
+from app.codegen import SourceFormat, explain_step, generate
 from app.config import MAX_HISTORY_ENTRIES, PREVIEW_PAGE_SIZE
 from app.db import Compilation, Dataset, HistoryEntry, Workspace, get_session
 from app.executor import ExecutionError, run_pipeline, sandbox_status
@@ -46,6 +48,7 @@ from app.services.ingest import IngestError, read_upload
 from app.storage import StorageError, get_storage
 
 router = APIRouter(prefix="/api/workspaces", tags=["workspace"])
+log = logging.getLogger("mlbenchx")
 
 
 # --------------------------------------------------------------------------------------
@@ -173,10 +176,20 @@ def _steps_view(frame: pd.DataFrame, config: PipelineConfig) -> list[dict[str, A
     return view
 
 
+def _source_of(workspace: Workspace) -> SourceFormat:
+    """How the generated script must read this workspace's file.
+
+    The script is handed the original upload, so it has to parse it with the separator
+    and encoding ingestion detected. Assuming a comma turns a semicolon export into one
+    column per row.
+    """
+    return SourceFormat.from_dataset(workspace.dataset)
+
+
 def _serialise(workspace: Workspace, frame: pd.DataFrame, session: Session) -> dict[str, Any]:
     """The whole workspace, as every mutating route returns it."""
     config = _config_of(workspace)
-    generated = generate(config)
+    generated = generate(config, _source_of(workspace))
     latest = session.scalars(
         select(Compilation)
         .where(Compilation.workspace_id == workspace.id)
@@ -195,6 +208,10 @@ def _serialise(workspace: Workspace, frame: pd.DataFrame, session: Session) -> d
             "rows": workspace.dataset.n_rows,
             "columns": workspace.dataset.n_columns,
             "size_bytes": workspace.dataset.size_bytes,
+            # What ingestion detected. Shown so the user can confirm the file was read
+            # the way they expect — a wrong separator is silent until it is displayed.
+            "delimiter": workspace.dataset.delimiter,
+            "encoding": workspace.dataset.encoding,
         },
         "config": config.model_dump(),
         "code": workspace.code,
@@ -234,12 +251,12 @@ def _code_to_run(workspace: Workspace, source: str) -> tuple[str, str]:
     """The code that will actually execute, and where it came from."""
     config = _config_of(workspace)
     if source == "pipeline":
-        return generate(config), "pipeline"
+        return generate(config, _source_of(workspace)), "pipeline"
     if source == "editor":
         return workspace.code, "editor"
     if workspace.code_is_edited and workspace.code.strip():
         return workspace.code, "editor"
-    return generate(config), "pipeline"
+    return generate(config, _source_of(workspace)), "pipeline"
 
 
 # --------------------------------------------------------------------------------------
@@ -247,23 +264,37 @@ def _code_to_run(workspace: Workspace, source: str) -> tuple[str, str]:
 # --------------------------------------------------------------------------------------
 
 
+def _workspace_of(dataset_id: str, session: Session) -> Workspace | None:
+    return session.scalars(
+        select(Workspace).where(Workspace.dataset_id == dataset_id)
+    ).first()
+
+
 @router.post("/from-dataset/{dataset_id}", status_code=201, summary="Open a workspace")
-def create_workspace(dataset_id: str, session: Session = Depends(get_session)) -> Any:
+def create_workspace(
+    dataset_id: str, response: Response, session: Session = Depends(get_session)
+) -> Any:
     """Open the workspace for a dataset, creating it on first use.
 
     Idempotent: a dataset has exactly one workspace, and asking twice returns the same
-    one rather than discarding the work in it.
+    one rather than discarding the work in it. 201 when this call created it, 200 when it
+    already existed.
+
+    The existence check alone is not enough. Building a workspace re-reads the dataset
+    and measures its health, which takes long enough for a second request — React
+    StrictMode sends one on every mount in development — to pass the same check. The
+    unique index on ``dataset_id`` then rejects the second insert, and that rejection is
+    answered by returning the workspace the first request made.
     """
     dataset = session.get(Dataset, dataset_id)
     if dataset is None:
         raise HTTPException(status_code=404, detail="No dataset with that id.")
 
-    existing = session.scalars(
-        select(Workspace).where(Workspace.dataset_id == dataset_id)
-    ).first()
+    existing = _workspace_of(dataset_id, session)
     frame = _frame(dataset)
 
     if existing is not None:
+        response.status_code = 200
         return _serialise(existing, frame, session)
 
     config = PipelineConfig(target=_guess_target(frame))
@@ -271,12 +302,28 @@ def create_workspace(dataset_id: str, session: Session = Depends(get_session)) -
         id=uuid.uuid4().hex,
         dataset_id=dataset_id,
         config=config.model_dump(),
-        code=generate(config),
+        code=generate(config, SourceFormat.from_dataset(dataset)),
         code_is_edited=False,
         baseline_health=dict(assess(frame, config.target)),
     )
+    log.info("Creating workspace for dataset %s", dataset_id)
     session.add(workspace)
-    session.flush()
+    try:
+        session.flush()
+    except IntegrityError:
+        # Only a concurrent request for the same dataset is expected here, and it leaves
+        # a workspace behind. Anything else — no row for this dataset after rolling
+        # back — is not the race, and is re-raised untouched.
+        session.rollback()
+        winner = _workspace_of(dataset_id, session)
+        if winner is None:
+            raise
+        log.info(
+            "Concurrent workspace creation for dataset %s; returning workspace %s",
+            dataset_id, winner.id,
+        )
+        response.status_code = 200
+        return _serialise(winner, frame, session)
     _record(workspace, "created", f"Opened {dataset.filename}", session,
             config=workspace.config)
     session.commit()
@@ -334,7 +381,7 @@ def update_config(
     previous = _config_of(workspace)
     workspace.config = update.config.model_dump()
     if not workspace.code_is_edited:
-        workspace.code = generate(update.config)
+        workspace.code = generate(update.config, _source_of(workspace))
     workspace.updated_at = _now()
 
     summary = update.summary or _describe_change(previous, update.config)
@@ -378,7 +425,7 @@ def update_code(
     leave the workspace permanently flagged as diverged for no reason.
     """
     workspace = _get_workspace(workspace_id, session)
-    generated = generate(_config_of(workspace))
+    generated = generate(_config_of(workspace), _source_of(workspace))
 
     workspace.code = update.code
     workspace.code_is_edited = update.code.strip() != generated.strip()
@@ -391,7 +438,7 @@ def update_code(
 def reset_code(workspace_id: str, session: Session = Depends(get_session)) -> Any:
     """Throw away hand edits and regenerate from the configuration."""
     workspace = _get_workspace(workspace_id, session)
-    workspace.code = generate(_config_of(workspace))
+    workspace.code = generate(_config_of(workspace), _source_of(workspace))
     workspace.code_is_edited = False
     workspace.updated_at = _now()
     _record(workspace, "code", "Reset the code to match the pipeline", session,
@@ -446,7 +493,7 @@ def _score_of(config: PipelineConfig, workspace: Workspace) -> int | None:
     """
     dataset_bytes = _dataset_bytes(workspace.dataset)
     try:
-        result = run_pipeline(generate(config), dataset_bytes)
+        result = run_pipeline(generate(config, _source_of(workspace)), dataset_bytes)
     except ExecutionError:
         return None
     if not result.ok or result.frame is None:
@@ -511,6 +558,16 @@ def compile_pipeline(
             "steps": execution.report.get("steps", []),
             "train_rows": execution.report.get("train_rows"),
             "test_rows": execution.report.get("test_rows"),
+            # How the held-out rows were chosen. Shown in the interface because
+            # "we split before fitting" is the product's central claim, and a claim
+            # the user cannot see the evidence for is just a sentence.
+            "split": {
+                "train_rows": execution.report.get("train_rows"),
+                "test_rows": execution.report.get("test_rows"),
+                "stratified": execution.report.get("stratified"),
+                "test_size": execution.report.get("test_size"),
+                "seed": execution.report.get("seed"),
+            },
             "comparison": compare(before, after),  # type: ignore[arg-type]
         }
         workspace.last_compilation_id = compilation.id
@@ -729,8 +786,11 @@ def restore_history(
 
     config = PipelineConfig.model_validate(entry.config)
     workspace.config = entry.config
-    workspace.code = entry.code or generate(config)
-    workspace.code_is_edited = bool(entry.code) and entry.code.strip() != generate(config).strip()
+    _source = _source_of(workspace)
+    workspace.code = entry.code or generate(config, _source)
+    workspace.code_is_edited = (
+        bool(entry.code) and entry.code.strip() != generate(config, _source).strip()
+    )
     workspace.updated_at = _now()
     _record(workspace, "restore", f"Restored: {entry.summary}", session, config=entry.config)
     session.commit()

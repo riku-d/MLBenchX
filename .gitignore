@@ -16,3 +16,4 @@ backend/tests/fixtures/perf_10mb.csv
 # Coverage output
 backend/htmlcov/
 backend/.coverage
+.claude/settings.local.json

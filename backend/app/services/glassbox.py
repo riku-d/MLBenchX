@@ -131,6 +131,7 @@ __all__ = [
     "introspect",
     "build_feature_map",
     "fit_preprocessing",
+    "choose_stratification",
     "export_script",
     "format_log",
     "format_report",
@@ -1258,6 +1259,113 @@ class PreprocessingResult:
     #: make "this script reproduces exactly what you were shown" false.
     test_size: float = TEST_SIZE
     seed: int = SEED
+    #: Whether the split kept each class's share the same on both sides. Recorded
+    #: rather than inferred: "no stratification" and "stratification that happened to
+    #: change nothing" look identical in the resulting folds, and only one of them is
+    #: something the user needs told.
+    stratified: bool = False
+
+
+def _blank_non_finite(frame: pd.DataFrame) -> int:
+    """Replace ``inf``/``-inf`` with ``NaN`` in place. Returns how many were replaced.
+
+    Mutates the frame it is given, which is safe here because the caller owns it: it
+    is the feature frame produced by ``df.drop(columns=[target])``, a copy that never
+    leaves this function. The user's frame is not touched.
+    """
+    replaced = 0
+    for column in frame.columns:
+        series = frame[column]
+        if not pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+            continue
+        mask = np.isinf(series.to_numpy(dtype="float64", na_value=np.nan))
+        count = int(mask.sum())
+        if count:
+            frame.loc[mask, column] = np.nan
+            replaced += count
+    return replaced
+
+
+def choose_stratification(
+    y: pd.Series, classification: bool, test_size: float
+) -> tuple[pd.Series | None, dict[str, Any] | None]:
+    """Decide whether the split can be stratified, and say why when it cannot.
+
+    Stratifying keeps each class's share the same on both sides of the split, which is
+    the only way a rare class is represented in the held-out rows at all. Three things
+    stop it, and each one is reported rather than absorbed: a target with one class,
+    a class with a single row, and a test fold smaller than the number of classes.
+
+    That third condition is the one that is easy to miss. ``train_test_split`` has to
+    place at least one row of every class on each side, so it refuses outright when
+    either fold has fewer rows than there are classes — a 60-row file with 20 classes
+    holds out 12 rows and cannot cover them. Left unchecked that surfaces as a
+    ``ValueError`` from deep inside sklearn, phrased in terms of ``test_size`` and
+    counts the user never chose. Checking it here turns an aborted run into a split
+    that happens, with a warning that names the real problem.
+
+    The fold sizes are computed the way ``sklearn.model_selection._validate_shuffle_split``
+    computes them, so this predicts that function's verdict rather than approximating it.
+
+    Returns ``(stratify_argument, warning_or_None)``.
+    """
+    if not classification:
+        return None, None
+
+    counts = y.value_counts(dropna=False)
+    n_classes = int(len(counts))
+
+    if n_classes <= 1:
+        return None, {
+            "kind": "stratification_disabled",
+            "severity": "warn",
+            "message": "The split was not stratified: the target has only one class.",
+            "suggestion": "A single-class target cannot be predicted; pick another column.",
+            "classes": {},
+        }
+
+    singletons = counts[counts < 2]
+    if len(singletons):
+        # Falling back silently would leave the user believing their rare class is
+        # represented on both sides of the split when it cannot be. The whole point of
+        # stratifying is the rare class, so losing it is exactly what needs saying.
+        named = ", ".join(str(v) for v in singletons.index[:5])
+        return None, {
+            "kind": "stratification_disabled",
+            "severity": "warn",
+            "message": (
+                f"{len(singletons)} class(es) have fewer than 2 rows ({named}), so "
+                "the split could not be stratified."
+            ),
+            "suggestion": (
+                "The train and test folds may not contain the same classes. Collect "
+                "more examples of the rare class, or merge it into a neighbouring "
+                "one, before trusting any score."
+            ),
+            "classes": {str(k): int(v) for k, v in singletons.items()},
+        }
+
+    n_samples = int(len(y))
+    n_test = math.ceil(test_size * n_samples)
+    n_train = n_samples - n_test
+    if min(n_test, n_train) < n_classes:
+        smaller = "held-out" if n_test <= n_train else "training"
+        return None, {
+            "kind": "stratification_disabled",
+            "severity": "warn",
+            "message": (
+                f"{n_classes} classes across {n_samples:,} rows leave a {smaller} fold "
+                f"of {min(n_test, n_train):,} rows, too few to hold one of every class, "
+                "so the split could not be stratified."
+            ),
+            "suggestion": (
+                "Some classes will be missing from one side of the split. Collect more "
+                "rows, or group the rarer classes together, before trusting any score."
+            ),
+            "classes": {str(k): int(v) for k, v in counts.items()},
+        }
+
+    return y, None
 
 
 def _is_classification(task_type: str) -> bool:
@@ -1316,9 +1424,34 @@ def fit_preprocessing(
     if target not in df.columns:
         raise ValueError(f"target column {target!r} is not in the frame")
     classification = _is_classification(task_type)
+    warnings: list[dict[str, Any]] = []
 
     # 1. Stateless repairs that must precede the split (spec §4a).
     #
+    #    A row with no value in the target teaches nothing — there is no answer in it
+    #    to learn — and carrying one forward fails in two different ways depending on
+    #    the task. Stratification reads the label, so on a classification target a
+    #    blank arrives at ``train_test_split`` as a class of its own and stops the run
+    #    with a message about NaN that says nothing about the user's file. On a
+    #    regression target nothing raises at all: the blank travels into ``y_train``
+    #    and quietly corrupts whatever is fitted on it. Dropping the rows here makes
+    #    both paths behave the same way, and says so.
+    blank_targets = int(df[target].isna().sum())
+    if blank_targets:
+        df = df[df[target].notna()].reset_index(drop=True)
+        warnings.append({
+            "kind": "blank_targets_removed",
+            "severity": "info",
+            "message": (
+                f"Left out {blank_targets:,} row(s) with no value in {target}."
+            ),
+            "suggestion": (
+                "A row with no answer recorded cannot teach the model anything, and "
+                "cannot be scored against either."
+            ),
+            "count": blank_targets,
+        })
+
     #    Deduplication belongs here and nowhere else. A repeated row left in place is
     #    counted twice when the model fits, and — worse — its copies can land on
     #    opposite sides of the split, so the model is scored on rows it has already
@@ -1326,16 +1459,6 @@ def fit_preprocessing(
     duplicate_rows = int(df.duplicated().sum())
     if duplicate_rows:
         df = df.drop_duplicates().reset_index(drop=True)
-
-    # 2. Separate the label from the features.
-    y = df[target]
-    X = df.drop(columns=[target])
-
-    # 2. Split FIRST — before any column is profiled, screened or fitted. Stratify so a
-    #    rare class is represented in both folds; fall back when a class is too small to
-    #    appear on both sides.
-    warnings: list[dict[str, Any]] = []
-    if duplicate_rows:
         warnings.append({
             "kind": "duplicates_removed",
             "severity": "info",
@@ -1346,43 +1469,47 @@ def fit_preprocessing(
             ),
             "count": duplicate_rows,
         })
-    stratify = None
-    if classification:
-        counts = y.value_counts(dropna=False)
-        singletons = counts[counts < 2]
-        if len(counts) > 1 and int(counts.min()) >= 2:
-            stratify = y
-        elif len(singletons):
-            # Falling back silently would leave the user believing their rare class is
-            # represented on both sides of the split when it cannot be. The whole point
-            # of stratifying is the rare class, so losing it is exactly what needs
-            # saying.
-            named = ", ".join(str(v) for v in singletons.index[:5])
-            warnings.append({
-                "kind": "stratification_disabled",
-                "severity": "warn",
-                "message": (
-                    f"{len(singletons)} class(es) have fewer than 2 rows ({named}), so "
-                    "the split could not be stratified."
-                ),
-                "suggestion": (
-                    "The train and test folds may not contain the same classes. Collect "
-                    "more examples of the rare class, or merge it into a neighbouring "
-                    "one, before trusting any score."
-                ),
-                "classes": {str(k): int(v) for k, v in singletons.items()},
-            })
+
+    if df.empty:
+        raise ValueError(
+            f"No rows are left once rows with no value in {target!r} are set aside, so "
+            "there is nothing to learn from."
+        )
+
+    # 2. Separate the label from the features.
+    y = df[target]
+    X = df.drop(columns=[target])
+
+    #    Infinity is an overflow rather than a measurement, and every estimator below
+    #    rejects it outright. Read as a blank, it is filled from the training rows like
+    #    any other gap — which is what "the real value is unknown" means. Ingestion
+    #    already does this for an uploaded file; it is repeated here because this
+    #    function is called with frames that did not come through it.
+    non_finite = _blank_non_finite(X)
+    if non_finite:
+        warnings.append({
+            "kind": "non_finite_values",
+            "severity": "warn",
+            "message": (
+                f"Treated {non_finite:,} infinite value(s) as missing before splitting."
+            ),
+            "suggestion": (
+                "Infinity usually means an overflow or a division by zero upstream. "
+                "Check how the column was calculated — the fill value used in its place "
+                "is in the imputation step below."
+            ),
+            "count": non_finite,
+        })
+
+    # 3. Split FIRST — before any column is profiled, screened or fitted. Stratify so a
+    #    rare class is represented in both folds; fall back when the label cannot
+    #    support it, and say why rather than falling back silently.
+    stratify, stratify_warning = choose_stratification(y, classification, test_size)
+    if stratify_warning is not None:
+        warnings.append(stratify_warning)
     X_train_raw, X_test_raw, y_train, y_test = train_test_split(
         X, y, test_size=test_size, random_state=seed, shuffle=True, stratify=stratify
     )
-    if classification and stratify is None and not warnings:
-        warnings.append({
-            "kind": "stratification_disabled",
-            "severity": "warn",
-            "message": "The split was not stratified: the target has only one class.",
-            "suggestion": "A single-class target cannot be predicted; pick another column.",
-            "classes": {},
-        })
 
     # 4. Screen and profile the TRAINING fold only. Both are measurements, so both
     #    belong on this side of the split: uniqueness, missing rate and cardinality all
@@ -1457,6 +1584,7 @@ def fit_preprocessing(
         checks=checks,
         test_size=test_size,
         seed=seed,
+        stratified=stratify is not None,
     )
 
 

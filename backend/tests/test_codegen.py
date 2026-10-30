@@ -348,3 +348,132 @@ def test_every_step_has_an_explanation_that_reflects_its_options() -> None:
         )}),
     )
     assert median != mean
+
+
+# --------------------------------------------------------------------------------------
+# Decisions, like fits, are made from the training rows only
+#
+# The generated script always fitted on the training rows. Two of its *decisions* were
+# taken over the whole file: which columns are too empty to keep, and which calendar
+# parts are worth emitting. Both change the shape of the feature matrix, so taking
+# either one with the held-out rows in view is the same leak as fitting on them, one
+# step removed — and it is invisible in the output, because the result is a pipeline
+# that simply has a column it should not have.
+#
+# Each test is built so that the whole-file answer and the training-fold answer differ,
+# which is what makes it fail against the previous implementation rather than pass
+# vacuously against both.
+# --------------------------------------------------------------------------------------
+
+
+def _folds(frame: pd.DataFrame, target: str) -> tuple[pd.Index, pd.Index]:
+    """The split the generated script will make, computed the same way it computes it."""
+    from sklearn.model_selection import train_test_split
+
+    train_index, test_index = train_test_split(
+        frame.index, test_size=0.2, random_state=42, shuffle=True, stratify=frame[target]
+    )
+    return pd.Index(train_index), pd.Index(test_index)
+
+
+def run_generated_on(
+    config: PipelineConfig, workspace: Path, source: Path
+) -> tuple[pd.DataFrame, dict]:
+    """:func:`run_generated`, against a file the test wrote rather than the fixture."""
+    script_source = generate(config)
+    compile(script_source, "pipeline.py", "exec")
+
+    workspace.mkdir(parents=True, exist_ok=True)
+    script = workspace / "pipeline.py"
+    script.write_text(script_source)
+    output = workspace / "out.csv"
+    report = workspace / "report.json"
+
+    completed = subprocess.run(
+        [sys.executable, str(script)],
+        cwd=workspace,
+        capture_output=True,
+        text=True,
+        timeout=300,
+        env={
+            **os.environ,
+            "MLBX_INPUT": str(source),
+            "MLBX_OUTPUT": str(output),
+            "MLBX_REPORT": str(report),
+        },
+    )
+    assert completed.returncode == 0, completed.stderr[-2000:]
+    return pd.read_csv(output), json.loads(report.read_text())
+
+
+def test_a_column_is_dropped_on_how_empty_the_training_rows_are(workspace) -> None:
+    """70% blank in the training fold, 56% blank over the file. The threshold is 60%."""
+    import numpy as np
+
+    rng = np.random.default_rng(101)
+    frame = pd.DataFrame({
+        "f1": rng.normal(size=200),
+        "sparse": rng.normal(size=200),
+        "label": np.tile([0, 1], 100),
+    })
+    train_index, test_index = _folds(frame, "label")
+    blanked = rng.choice(train_index, size=112, replace=False)
+    frame.loc[blanked, "sparse"] = np.nan
+
+    train_rate = frame.loc[train_index, "sparse"].isna().mean()
+    whole_rate = frame["sparse"].isna().mean()
+    assert train_rate > 0.60 >= whole_rate, (train_rate, whole_rate)
+    assert frame.loc[test_index, "sparse"].notna().all()
+
+    source = workspace / "sparse.csv"
+    frame.to_csv(source, index=False)
+    out, _ = run_generated_on(PipelineConfig(target="label"), workspace, source)
+
+    assert "sparse" not in out.columns, (
+        "the column survived, so its emptiness was measured over the held-out rows too"
+    )
+    assert "f1" in out.columns
+
+
+def test_a_calendar_part_is_emitted_on_how_the_training_rows_vary(workspace) -> None:
+    """``month`` is constant in the training fold and varies only in the held-out rows."""
+    import numpy as np
+
+    rng = np.random.default_rng(102)
+    frame = pd.DataFrame({
+        "f1": rng.normal(size=200),
+        "signed_on": ["2024-03-01"] * 200,
+        "label": np.tile([0, 1], 100),
+    })
+    _, test_index = _folds(frame, "label")
+    frame.loc[test_index, "signed_on"] = "2024-09-01"
+
+    source = workspace / "dates.csv"
+    frame.to_csv(source, index=False)
+    out, _ = run_generated_on(PipelineConfig(target="label"), workspace, source)
+
+    assert "signed_on_month" not in out.columns, (
+        "a calendar part was emitted because the held-out rows varied, which the "
+        "training rows cannot see"
+    )
+    assert "signed_on" not in out.columns
+
+
+def test_infinity_in_the_source_file_does_not_stop_the_generated_script(workspace) -> None:
+    import numpy as np
+
+    rng = np.random.default_rng(103)
+    frame = pd.DataFrame({
+        "ratio": rng.normal(5, 1, 200),
+        "amount": rng.normal(100, 20, 200),
+        "label": np.tile([0, 1], 100),
+    })
+    frame.loc[0, "ratio"] = np.inf
+    frame.loc[1, "ratio"] = -np.inf
+
+    source = workspace / "inf.csv"
+    frame.to_csv(source, index=False)
+    out, report = run_generated_on(PipelineConfig(target="label"), workspace, source)
+
+    assert np.isfinite(out["ratio"].to_numpy(dtype=float)).all()
+    assert any("infinite" in step.get("action", "") for step in report["steps"])

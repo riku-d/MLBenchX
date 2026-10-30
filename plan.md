@@ -3,11 +3,12 @@
 Transparent AutoML for tabular data. Upload → profile → review and override the
 preprocessing plan → execute → see every transformation explained → download artifacts.
 
-Phase 1 source of truth: [docs/PHASE1_SPEC.md](docs/PHASE1_SPEC.md); status:
-[AUDIT.md](AUDIT.md).
+Phase 1 source of truth: [docs/PHASE1_SPEC.md](docs/PHASE1_SPEC.md). Requirements and
+acceptance criteria: [PRD.md](PRD.md). Technical design: [Design.md](Design.md).
 
-Verification evidence — commands run, results, coverage, timings, known limitations —
-is in [VERIFICATION.md](VERIFICATION.md).
+Verification evidence — commands run, actual results, coverage, and known limitations —
+is in [AUDIT.md](AUDIT.md) §5, with the test and acceptance plan it satisfies in
+[PRD.md](PRD.md) §8.
 
 ## Layout
 

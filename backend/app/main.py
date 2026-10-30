@@ -38,6 +38,8 @@ import joblib
 import pandas as pd
 from fastapi import Depends, FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
 from fastapi.responses import JSONResponse, PlainTextResponse
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session
@@ -72,6 +74,7 @@ from app.schemas import (
 )
 from app.services import explain, profile as profiling
 from app.services.glassbox import PreprocessingResult, export_script, fit_preprocessing
+from app.services.health import assess
 from app.services.ingest import (
     IngestError,
     IngestResult,
@@ -84,6 +87,7 @@ from app.services.screening import (
     target_leakage_screen,
 )
 from app.storage import StorageError, get_storage
+from app.planning_api import router as planning_router
 from app.workspace import router as workspace_router
 from app.services.target import (
     class_balance,
@@ -127,7 +131,13 @@ app.add_middleware(
         "http://localhost:5173", "http://127.0.0.1:5173",
         "http://localhost:4173", "http://127.0.0.1:4173",
     ],
-    allow_methods=["GET", "POST"],
+    # Every method the routes below actually use. The workspace saves its
+    # configuration and the editor's contents with PUT, and a browser asks permission
+    # for that with a preflight before it sends one — so a method missing here is not a
+    # stricter policy, it is a feature that cannot be used from the interface at all.
+    # The test suite calls the app directly and never performs a preflight, which is
+    # why this drifted unnoticed; `test_api.py` now checks the two against each other.
+    allow_methods=["GET", "POST", "PUT", "DELETE"],
     allow_headers=["*"],
 )
 
@@ -193,6 +203,7 @@ def _safe_filename(name: str, fallback: str) -> str:
 
 
 app.include_router(workspace_router)
+app.include_router(planning_router)
 
 
 @dataclass
@@ -221,26 +232,112 @@ class UserFacingError(Exception):
     """An error whose message is written for the user and can be shown as-is."""
 
 
+#: HTTP status -> the machine-readable ``code`` that goes with it.
+#:
+#: The vocabulary is small and stable on purpose: a client branches on these, so adding
+#: a code is a contract change and inventing one per call site would make the field
+#: useless. The three categories the specification asks to be distinguishable map here —
+#: ``validation_error`` is a malformed request, ``bad_request`` and the 4xx codes are
+#: problems the user can fix, and ``internal_error`` is a defect in this application.
+_ERROR_CODES: dict[int, str] = {
+    400: "bad_request",
+    404: "not_found",
+    409: "conflict",
+    410: "gone",
+    413: "payload_too_large",
+    415: "unsupported_media_type",
+    422: "validation_error",
+    500: "internal_error",
+    503: "service_unavailable",
+}
+
+
+def _envelope(
+    status: int, message: str, detail: Any = None, code: str | None = None
+) -> JSONResponse:
+    """The one error shape every route answers with.
+
+    ``docs/PHASE1_SPEC.md`` §7 asks for ``{code, message, detail}``; every existing
+    client — and every existing test — reads ``error``. Both are served, which costs one
+    duplicated string and breaks nothing: ``error`` stays exactly what it has always
+    been, and the three specified fields are added beside it.
+
+    That is the whole migration. There is no second URL, no version header and no date
+    on which ``error`` stops being sent; a field nobody reads is cheaper than a flag day.
+    If ``error`` is ever retired it will be because a search shows no caller left, and
+    this docstring is where that decision gets recorded.
+
+    ``detail`` carries structure a sentence cannot — which field of a request was wrong,
+    and why. It is ``null`` when there is nothing to add, never a copy of the message.
+    """
+    return JSONResponse(
+        status_code=status,
+        content={
+            # The original contract, unchanged.
+            "error": message,
+            # The specified contract, added.
+            "code": code or _ERROR_CODES.get(status, "error"),
+            "message": message,
+            "detail": detail,
+        },
+    )
+
+
 @app.exception_handler(UserFacingError)
 async def _user_facing(_request, exc: UserFacingError) -> JSONResponse:
-    return JSONResponse(status_code=400, content={"error": str(exc)})
+    return _envelope(400, str(exc))
 
 
-@app.exception_handler(HTTPException)
-async def _http_error(_request, exc: HTTPException) -> JSONResponse:
-    return JSONResponse(status_code=exc.status_code, content={"error": exc.detail})
+@app.exception_handler(StarletteHTTPException)
+async def _http_error(_request, exc: StarletteHTTPException) -> JSONResponse:
+    # Registered against Starlette's class, not FastAPI's subclass of it. A request for
+    # a URL no route matches is raised by the router itself as the base class, so a
+    # handler bound to the subclass misses it — and those 404s came back as
+    # `{"detail": "Not Found"}`, the one shape this envelope exists to eliminate.
+    # `detail` on an HTTPException is normally the sentence itself. When a route raises
+    # one with a structured detail instead, that structure is preserved and the message
+    # falls back to the status's own phrase rather than being a dict cast to a string.
+    if isinstance(exc.detail, str):
+        return _envelope(exc.status_code, exc.detail)
+    return _envelope(
+        exc.status_code,
+        _ERROR_CODES.get(exc.status_code, "error").replace("_", " ").capitalize() + ".",
+        detail=exc.detail,
+    )
+
+
+@app.exception_handler(RequestValidationError)
+async def _invalid_request(_request, exc: RequestValidationError) -> JSONResponse:
+    """A malformed request body or query.
+
+    FastAPI's own handler answers these with ``{"detail": [...]}`` — a different shape
+    from every other error this application returns, which is exactly the inconsistency
+    the specification's uniform envelope exists to remove. The per-field list is kept,
+    in ``detail``, because it is genuinely the useful part.
+    """
+    fields = [
+        {
+            "field": ".".join(str(part) for part in error.get("loc", ())[1:]) or "body",
+            "problem": error.get("msg", ""),
+        }
+        for error in exc.errors()
+    ]
+    named = ", ".join(field["field"] for field in fields[:3]) or "the request body"
+    return _envelope(
+        422,
+        f"That request could not be read: check {named}.",
+        detail={"fields": fields},
+    )
 
 
 @app.exception_handler(Exception)
 async def _unexpected(_request, exc: Exception) -> JSONResponse:
     # The traceback goes to the terminal; the user gets a sentence they can act on.
     log.exception("unhandled error while analysing", exc_info=exc)
-    return JSONResponse(
-        status_code=500,
-        content={
-            "error": "Something went wrong reading that file. Try the example file to "
-                     "check the app is working, then re-save yours as CSV and retry."
-        },
+    return _envelope(
+        500,
+        "Something went wrong reading that file. Try the example file to "
+        "check the app is working, then re-save yours as CSV and retry.",
     )
 
 
@@ -305,7 +402,11 @@ def _ingest_dataset(
         n_columns=ingested.columns,
         encoding=ingested.encoding,
         delimiter=ingested.delimiter,
-        health_score=ingested.quality_score,
+        # One canonical score, from the same six-dimension assessment the workspace
+        # shows. The ingest quality figure is a cheaper, different measurement and is
+        # reported separately as `ingest_check` — showing two numbers both labelled
+        # "health" on two screens is how a user stops trusting either.
+        health_score=assess(ingested.frame).score,
         cleaning=list(ingested.cleaning),
     )
     session.add(dataset)
@@ -356,7 +457,8 @@ def _store_profile(
     profile.n_columns = document["n_columns"]
     profile.duplicate_rows = document["duplicate_rows"]
     profile.missing_cells = ingested.missing_cells
-    profile.health_score = ingested.quality_score
+    # The same canonical score the dataset row and the workspace show.
+    profile.health_score = assess(ingested.frame).score
     profile.payload = document
     session.add(profile)
     session.flush()
@@ -440,10 +542,14 @@ def _preprocess(
             high_card_encoder=options.high_card_encoder,
         )
     except ValueError as exc:
-        raise UserFacingError(
-            f"We couldn't prepare that data: {exc}".split("Reasons:")[0].strip()
-            + " Try a file with more usable columns."
-        ) from exc
+        # "Reasons:" introduces the JSON dump of every dropped column and its reason,
+        # which belongs in the log rather than in a sentence. The advice to try a file
+        # with more columns is only advice when columns are what ran out, so it is
+        # attached to that case rather than to every failure the engine can report.
+        message = f"We couldn't prepare that data: {exc}".split("Reasons:")[0].strip()
+        if "column" in str(exc):
+            message += " Try a file with more usable columns."
+        raise UserFacingError(message) from exc
 
     steps = explain.build_steps(frame, result)
     dropped = explain.build_dropped(result, frame, result.excluded)
@@ -491,7 +597,17 @@ def _preprocess(
             "train_rows": len(result.X_train),
             "test_rows": len(result.X_test),
             "features": int(result.X_train.shape[1]),
+            "stratified": result.stratified,
+            "test_size": result.test_size,
+            "seed": result.seed,
         },
+        # The engine raises these and nothing downstream was reading them, so a split
+        # that could not be stratified, a fold that drifted, or a row dropped for a
+        # blank target was computed and then discarded. They are part of the response
+        # for the same reason the step log is: a condition the user is not told about
+        # is a silent fallback.
+        "warnings": result.warnings,
+        "checks": result.checks,
         "took_ms": round((time.perf_counter() - started) * 1000),
     }
 
@@ -783,13 +899,40 @@ async def get_preprocess_log(
 
 @app.get(
     "/api/runs/{run_id}",
-    response_model=AnalysisResponse,
     responses={404: {"model": ErrorResponse}},
     summary="Re-read a completed run",
 )
 async def get_run(run_id: str, session: Session = Depends(get_session)) -> Any:
-    """The stored analysis document, exactly as first computed. Nothing is refitted."""
-    return _get_run(run_id, session).payload
+    """One run, by id.
+
+    Two kinds of run answer here, and which one you get depends on the id:
+
+    * A **run of a reviewed plan** (``plans`` → ``runs``) returns the resource the spec
+      describes — status, the plan version it executed, the split, the output hash and
+      the artifacts it produced.
+    * An id from the older ``/preprocess`` path returns that call's stored analysis
+      document, exactly as first computed.
+
+    Both are served from the same URL on purpose. The id spaces are disjoint (both are
+    uuid4), so the lookup is unambiguous, and an existing client holding an older run id
+    keeps getting the document it has always got. The alternative — a second URL for the
+    new resource — would leave the spec's ``/runs/{id}`` permanently wrong.
+    """
+    from app.db import Run as PlanRun
+    from app.planning_api import run_view
+
+    durable = session.get(PlanRun, run_id)
+    if durable is not None:
+        return run_view(durable)
+
+    # The legacy document, serialised through the model that used to be this route's
+    # ``response_model``. The declaration had to go — a response model cannot describe
+    # two different resources — but it was doing real work: it drops fields the schema
+    # does not declare, so returning the stored payload directly would quietly widen
+    # this route's output for every existing client.
+    return AnalysisResponse.model_validate(_get_run(run_id, session).payload).model_dump(
+        mode="json"
+    )
 
 
 # --------------------------------------------------------------------------------------

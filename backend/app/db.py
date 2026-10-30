@@ -1,6 +1,9 @@
 """Database models and session handling — SQLAlchemy 2.x on SQLite.
 
-Four tables, one per thing the app produces:
+Nine tables, one per thing the app produces. The first four record what the glass-box
+engine did to a dataset; three more (``workspaces``, ``compilations``, ``history``)
+record what the user is doing with it interactively; and two (``plans``, ``runs``)
+record the spec's reviewable plan and the durable, versioned execution of it.
 
 ``datasets``
     One uploaded file. The bytes themselves live in storage; this row records what it
@@ -46,7 +49,9 @@ from sqlalchemy import (
     Integer,
     String,
     Text,
+    UniqueConstraint,
     create_engine,
+    event,
     func,
 )
 from sqlalchemy.orm import (
@@ -218,6 +223,24 @@ engine = create_engine(
     future=True,
 )
 
+if DATABASE_URL.startswith("sqlite"):
+
+    @event.listens_for(engine, "connect")
+    def _enforce_foreign_keys(dbapi_connection, _record) -> None:  # pragma: no cover
+        """Turn on SQLite's foreign-key enforcement, per connection.
+
+        SQLite accepts ``ON DELETE CASCADE`` in a schema and then ignores it unless this
+        pragma is set, and it is off by default — so every cascade declared above was
+        documentation rather than behaviour. Deleting a dataset would have left its
+        profile, runs, plans and workspace behind, pointing at a row that no longer
+        exists. The pragma is per-connection, not per-database, which is why it is set
+        on the pool's connect event rather than once at startup.
+        """
+        cursor = dbapi_connection.cursor()
+        cursor.execute("PRAGMA foreign_keys=ON")
+        cursor.close()
+
+
 SessionLocal = sessionmaker(bind=engine, autoflush=False, expire_on_commit=False)
 
 
@@ -360,3 +383,121 @@ class HistoryEntry(TimestampedProjectMixin, Base):
     code: Mapped[str | None] = mapped_column(Text, nullable=True)
 
     workspace: Mapped[Workspace] = relationship(back_populates="history")
+
+
+# --------------------------------------------------------------------------------------
+# The plan and the run
+# --------------------------------------------------------------------------------------
+#
+# The tables above record a *configuration* applied to a dataset and the compilations it
+# produced. These two record the spec's §4 and §6 objects, which are different things:
+#
+# ``plans``
+#     A per-column decision document — what happens to each column and why — that the
+#     user reviews and edits before anything executes. Versioned, and **immutable once
+#     written**: an edit writes a new row with the next version rather than changing the
+#     one a run may already point at. That is what makes "this run used that plan" a
+#     fact rather than a hope, and it is why the table's primary key is a plan id while
+#     its identity is ``(dataset_id, version)``.
+#
+# ``runs``
+#     One execution of one plan version, with the artifacts it produced. A run records
+#     the plan id *and* the version it used, and additionally stores the whole plan
+#     document as its own ``plan.json`` artifact — belt and braces, so a run can be
+#     explained from its artifacts alone even if the database is unavailable.
+#
+# A run is never updated after it finishes. ``status`` moves ``running`` → ``succeeded``
+# or ``failed`` exactly once, and a failed run keeps its error rather than disappearing:
+# the user needs to read it, and a run that vanished on failure would make the history
+# of a dataset a record of only its successes.
+
+
+class Plan(TimestampedProjectMixin, Base):
+    """One version of the preprocessing plan for one dataset."""
+
+    __tablename__ = "plans"
+    __table_args__ = (
+        UniqueConstraint("dataset_id", "version", name="uq_plans_dataset_version"),
+    )
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("datasets.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    #: 1 for the proposal, incremented by every edit. Unique per dataset.
+    version: Mapped[int] = mapped_column(Integer, nullable=False, default=1)
+    #: The plan this one was derived from, so an edit trail can be followed back to the
+    #: original proposal.
+    parent_id: Mapped[str | None] = mapped_column(
+        String(32), ForeignKey("plans.id", ondelete="SET NULL"), nullable=True
+    )
+
+    target: Mapped[str] = mapped_column(String(255), nullable=False)
+    task: Mapped[str] = mapped_column(String(32), nullable=False)
+    #: ``proposed`` until a user edits it, then ``edited``. Promoted out of the document
+    #: because "show me the plans a user changed" should be a query.
+    origin: Mapped[str] = mapped_column(String(16), nullable=False, default="proposed")
+    n_columns: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    n_overridden: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    #: The whole :class:`~app.plan.PreprocessingPlan`, exactly as it will be executed.
+    document: Mapped[dict[str, Any]] = mapped_column(JSON, nullable=False, default=dict)
+
+    updated_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=lambda: datetime.now(timezone.utc), nullable=False
+    )
+
+    dataset: Mapped[Dataset] = relationship()
+    runs: Mapped[list["Run"]] = relationship(
+        back_populates="plan", cascade="all, delete-orphan", passive_deletes=True
+    )
+
+
+class Run(TimestampedProjectMixin, Base):
+    """One execution of one plan version, and the artifacts it produced."""
+
+    __tablename__ = "runs"
+
+    id: Mapped[str] = mapped_column(String(32), primary_key=True)
+    dataset_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("datasets.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    plan_id: Mapped[str] = mapped_column(
+        String(32), ForeignKey("plans.id", ondelete="CASCADE"), index=True, nullable=False
+    )
+    #: Copied rather than joined. A run names the exact version it used, and that answer
+    #: must survive the plan table being queried differently later.
+    plan_version: Mapped[int] = mapped_column(Integer, nullable=False)
+
+    #: ``running`` | ``succeeded`` | ``failed``. A failed run is never presented as a
+    #: result: every consumer checks this before reading the artifacts.
+    status: Mapped[str] = mapped_column(String(16), nullable=False, default="running")
+    completed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    duration_ms: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    target: Mapped[str] = mapped_column(String(255), nullable=False)
+    task: Mapped[str] = mapped_column(String(32), nullable=False)
+    seed: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    test_size: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    stratified: Mapped[bool] = mapped_column(Boolean, nullable=False, default=False)
+    train_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    test_rows: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    n_features: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    #: A digest of the prepared data. Two runs of the same plan on the same dataset
+    #: match on it or the determinism guarantee is false, which is a checkable claim
+    #: rather than an argued one.
+    output_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+
+    #: The inference contract (`schema.json`), promoted here as well as stored as an
+    #: artifact because Stage 4 will read it across many runs.
+    feature_schema: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    warnings: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list)
+    checks: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    #: ``{artifact name: storage key}``. Written only after every artifact is stored, so
+    #: a row never names a file that is not there.
+    artifacts: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)
+    error: Mapped[dict[str, Any] | None] = mapped_column(JSON, nullable=True)
+
+    dataset: Mapped[Dataset] = relationship()
+    plan: Mapped[Plan] = relationship(back_populates="runs")

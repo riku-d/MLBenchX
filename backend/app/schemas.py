@@ -32,6 +32,7 @@ __all__ = [
     "LogEntry",
     "LogResponse",
     "AnalysisResponse",
+    "PipelineWarning",
 ]
 
 ScalerName = Literal["standard", "minmax", "robust"]
@@ -159,6 +160,18 @@ class ColumnProfileOut(BaseModel):
     unique_rate: float
     n_rows: int
     outliers: OutlierSummary | None = None
+    #: Descriptive statistics, bin counts and the most frequent values.
+    #:
+    #: These were computed by `services/profile.py` and then discarded here, because a
+    #: response model drops what it does not declare — so the histogram the backend goes
+    #: to the trouble of computing server-side (a histogram of one page of rows is not a
+    #: histogram of the column) never reached the client that was meant to draw it.
+    #: Typed as permissive documents for the reason this file's docstring gives: the
+    #: interface renders them and does not branch on their leaves.
+    stats: dict[str, Any] | None = None
+    histogram: dict[str, Any] | None = None
+    top_values: list[dict[str, Any]] = Field(default_factory=list)
+    flags: list[str] = Field(default_factory=list)
     is_target: bool = False
     used: bool = True
     excluded_reason: str | None = None
@@ -191,8 +204,19 @@ class HealthDeduction(BaseModel):
 
 
 class QualityOut(BaseModel):
-    """The health score, what it cost, and why."""
+    """The ingest-time quality check — *not* the canonical health score.
 
+    A cheap arithmetic check run while the file is being read: blank cells, duplicate
+    rows, mostly-empty columns. The number shown throughout the interface is the
+    six-dimension :func:`~app.services.health.assess` score, which is measured
+    differently and will usually differ from this one. Both are kept because they answer
+    different questions, and ``label`` exists so neither can be mistaken for the other.
+    """
+
+    label: str = Field(
+        default="Ingest quality check (not the workspace health score)",
+        description="Names this measurement so it cannot be read as the health score.",
+    )
     score: int = Field(ge=0, le=100)
     rows_used: int
     missing_cells: int
@@ -308,6 +332,34 @@ class ResultInfo(BaseModel):
     train_rows: int
     test_rows: int
     features: int
+    #: Whether the split kept each class's share the same on both sides. ``False`` is
+    #: always accompanied by a ``stratification_disabled`` warning saying why.
+    stratified: bool = False
+    #: The split parameters actually used, so a caller can reproduce the run without
+    #: having to assume the defaults were in force.
+    test_size: float = 0.0
+    seed: int = 0
+
+
+class PipelineWarning(BaseModel):
+    """One condition the user needs to know about that is not tied to a single column.
+
+    A split that could not be stratified, a fold whose features are distributed
+    differently from the other, a target that was blank on some rows. These are the
+    records that would otherwise be a silent fallback, which is the one thing this
+    application is built not to do.
+
+    Extra keys are allowed because each ``kind`` carries its own evidence — the classes
+    that were too rare, the count of rows removed — and pinning them here would mean
+    editing this file to add a number to a sentence.
+    """
+
+    model_config = ConfigDict(extra="allow")
+
+    kind: str
+    severity: Literal["info", "warn", "critical"]
+    message: str
+    suggestion: str = ""
 
 
 class OptionsInfo(BaseModel):
@@ -331,6 +383,14 @@ class AnalysisResponse(BaseModel):
     dropped: list[DroppedColumn] = Field(default_factory=list)
     steps: list[StepCard] = Field(default_factory=list)
     result: ResultInfo
+    #: Conditions raised by the engine itself. Produced on every run; the workspace UI
+    #: does not render them yet, so today this is a backend contract that the
+    #: single-call clients and ``/api/docs`` can read.
+    warnings: list[PipelineWarning] = Field(default_factory=list)
+    #: The post-split checks: per-feature drift between the folds, class balance in
+    #: each, and the sanity baseline. A permissive document for the reason this file's
+    #: docstring gives — callers render it, they do not branch on its leaves.
+    checks: dict[str, Any] = Field(default_factory=dict)
     took_ms: int
 
 

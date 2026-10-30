@@ -4,8 +4,11 @@ ML-BenchX: transparent AutoML web app for tabular data. Phase 1 = vertical slice
 logic, API, DB, UI: upload → profile → review/override preprocessing plan → execute →
 see every transformation explained → download artifacts.
 
-This document is the source of truth for Phase 1. Implementation status is tracked in
-[AUDIT.md](../AUDIT.md); verification evidence in [VERIFICATION.md](../VERIFICATION.md).
+This document is the source of truth for Phase 1. Implementation status and verification
+evidence are tracked in [AUDIT.md](../AUDIT.md) — §3 for the stage-by-stage status, §5
+for the commands run and their actual results. The requirements this specification was
+turned into are in [PRD.md](../PRD.md) §3, and the technical design that implements them
+is in [Design.md](../Design.md).
 
 ---
 

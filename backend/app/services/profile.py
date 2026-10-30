@@ -50,6 +50,22 @@ _KIND_LABEL = {
 }
 
 
+def _finite(values: pd.Series) -> pd.Series:
+    """The float values of a numeric column that can actually be summarised.
+
+    Ingestion reads an infinity as a blank, so a frame that came through
+    :mod:`app.services.ingest` has none left. These functions are public and are also
+    handed frames built elsewhere, and every statistic below is undefined on a
+    non-finite value: a mean goes infinite, ``numpy.histogram`` refuses the range
+    outright, and both would reach the browser as a bare ``Infinity`` token that no
+    strict JSON parser reads back. Dropping them here describes the part of the column
+    that can be described; the count of what was dropped is the validity dimension's
+    job, in :mod:`app.services.health`.
+    """
+    numbers = values.astype("float64")
+    return numbers[np.isfinite(numbers)]
+
+
 def outlier_summary(series: pd.Series) -> dict[str, Any] | None:
     """Count values outside Tukey's fences, or ``None`` for a non-numeric column.
 
@@ -61,7 +77,7 @@ def outlier_summary(series: pd.Series) -> dict[str, Any] | None:
     """
     if not pd.api.types.is_numeric_dtype(series):
         return None
-    values = series.dropna().astype(float)
+    values = _finite(series.dropna())
     if values.empty:
         return None
 
@@ -93,7 +109,7 @@ def numeric_summary(series: pd.Series) -> dict[str, Any] | None:
     """
     if not pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
         return None
-    values = series.dropna().astype("float64")
+    values = _finite(series.dropna())
     if values.empty:
         return None
 
@@ -135,7 +151,9 @@ def histogram(series: pd.Series, bins: int = HISTOGRAM_BINS) -> dict[str, Any] |
             "other": int(len(values) - int(counts.sum())),
         }
 
-    numbers = values.astype("float64")
+    numbers = _finite(values)
+    if numbers.empty:
+        return None
     if numbers.nunique() == 1:
         only = float(numbers.iloc[0])
         return {

@@ -17,10 +17,11 @@ import {
   ChevronDown,
   Info,
   Scale,
+  Scissors,
   ShieldCheck,
   ShieldAlert,
 } from "lucide-react";
-import type { Health, HealthDimension, Workspace } from "../api";
+import type { Compilation, Health, HealthDimension, Workspace } from "../api";
 import { Badge, Delta, Meter, ScoreRing, Tabs } from "../components/ui";
 
 function toneFor(score: number) {
@@ -143,6 +144,64 @@ function Dimensions({
   );
 }
 
+/**
+ * How the data was divided.
+ *
+ * "We split before fitting" is the product's central claim, and a claim the user cannot
+ * see the evidence for is just a sentence. These numbers are read out of the report the
+ * generated script wrote as it ran — not recomputed here, so they describe what actually
+ * happened rather than what was configured.
+ */
+function SplitCard({ split }: { split: NonNullable<Compilation["result"]>["split"] }) {
+  if (!split || split.train_rows == null || split.test_rows == null) return null;
+
+  const total = split.train_rows + split.test_rows;
+  const trainShare = total > 0 ? (split.train_rows / total) * 100 : 0;
+  const rows: [string, string][] = [
+    ["Training set", `${split.train_rows.toLocaleString()} rows`],
+    ["Test set", `${split.test_rows.toLocaleString()} rows`],
+    ["Split", `${Math.round(trainShare)} / ${Math.round(100 - trainShare)}`],
+    ["Strategy", split.stratified ? "Stratified" : "Random"],
+    ["Random seed", String(split.seed ?? "—")],
+  ];
+
+  return (
+    <section className="mt-4 border-t border-line pt-3">
+      <h3 className="flex items-center gap-1.5 font-display text-[11px] tracking-[0.13em] text-faint uppercase">
+        <Scissors size={11} /> Train / test split
+      </h3>
+
+      <div className="mt-2.5 flex h-2 overflow-hidden rounded-full border border-line">
+        <div className="bg-accent" style={{ width: `${trainShare}%` }} />
+        <div
+          className="bg-raised"
+          style={{
+            width: `${100 - trainShare}%`,
+            backgroundImage:
+              "repeating-linear-gradient(45deg, transparent, transparent 3px, rgba(127,127,127,.35) 3px, rgba(127,127,127,.35) 6px)",
+          }}
+        />
+      </div>
+
+      <table className="mt-2.5 w-full">
+        <tbody>
+          {rows.map(([label, value]) => (
+            <tr key={label} className="text-[11.5px]">
+              <td className="py-0.5 text-muted">{label}</td>
+              <td className="tnum py-0.5 text-right font-mono text-text">{value}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+
+      <p className="mt-2 text-[11px] leading-relaxed text-faint">
+        The held-out rows were set aside before any value was measured or any decision
+        made, so nothing in them influenced this pipeline.
+      </p>
+    </section>
+  );
+}
+
 export function InsightsPanel({ workspace }: { workspace: Workspace }) {
   const [tab, setTab] = useState<"health" | "issues" | "changes">("health");
 
@@ -198,6 +257,8 @@ export function InsightsPanel({ workspace }: { workspace: Workspace }) {
             <div className="mt-4 border-t border-line pt-3">
               <Dimensions health={shown} comparison={comparison?.dimensions} />
             </div>
+
+            {succeeded && <SplitCard split={compilation!.result?.split} />}
 
             <details className="mt-3 border-t border-line pt-3">
               <summary className="cursor-pointer list-none text-[12px] text-muted transition-colors hover:text-text">

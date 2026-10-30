@@ -218,6 +218,14 @@ export type Compilation = {
     steps?: StepReport[];
     train_rows?: number | null;
     test_rows?: number | null;
+    /** How the held-out rows were chosen. The evidence for the leakage claim. */
+    split?: {
+      train_rows: number | null;
+      test_rows: number | null;
+      stratified: boolean | null;
+      test_size: number | null;
+      seed: number | null;
+    } | null;
     comparison?: Comparison;
   };
   health_before: Health | Record<string, never>;
@@ -242,6 +250,9 @@ export type Workspace = {
     rows: number;
     columns: number;
     size_bytes: number;
+    /** What ingestion detected — shown so a misread separator cannot stay silent. */
+    delimiter: string;
+    encoding: string;
   };
   config: PipelineConfig;
   code: string;
@@ -308,6 +319,202 @@ export class ApiError extends Error {
     this.status = status;
   }
 }
+
+
+// --------------------------------------------------------------------------------------
+// The plan and the run
+//
+// The propose -> review -> execute cycle. A plan is a decision per column, versioned and
+// never mutated; a run executes one version and keeps what it produced. These mirror
+// `app/plan.py`, `app/planning_api.py` and `app/db.py` by hand — see `app/schemas.py`
+// for why the contract is written down in two places rather than generated.
+// --------------------------------------------------------------------------------------
+
+export type PlanAction =
+  | "keep"
+  | "drop"
+  | "impute_median"
+  | "impute_mean"
+  | "impute_mode"
+  | "impute_constant"
+  | "encode_binary"
+  | "encode_onehot"
+  | "encode_ordinal"
+  | "encode_target"
+  | "encode_frequency"
+  | "datetime_expand"
+  | "passthrough";
+
+export type PlanWarning = {
+  severity: "info" | "warn" | "critical";
+  message: string;
+  suggestion?: string;
+  kind?: string;
+  [key: string]: unknown;
+};
+
+export type ColumnPlan = {
+  column: string;
+  original_name: string | null;
+  kind: string;
+  dtype: string;
+  action: PlanAction;
+  params: Record<string, unknown>;
+  reason: string;
+  /** The measurements the decision was made from, so the reason can be checked. */
+  stats: Record<string, number | string>;
+  alternatives: PlanAction[];
+  overridden: boolean;
+  warning: PlanWarning | null;
+  add_indicator: boolean;
+  rare_categories: string[];
+};
+
+export type PlanOptions = {
+  scaler: ScalerMethod | "none";
+  outliers: "report" | "clip";
+  missing_indicators: boolean;
+  rare_category_rate: number;
+  onehot_max_cardinality: number;
+  power_transform_skewed: boolean;
+  test_size: number;
+  seed: number;
+};
+
+export type PlanVersion = {
+  id: string;
+  version: number;
+  origin: string;
+  n_overridden: number;
+  created_at: string;
+};
+
+export type Plan = {
+  id: string;
+  dataset_id: string;
+  version: number;
+  parent_id: string | null;
+  origin: "proposed" | "edited";
+  target: string;
+  task: string;
+  n_columns: number;
+  n_overridden: number;
+  created_at: string;
+  updated_at: string;
+  columns: ColumnPlan[];
+  options: PlanOptions;
+  warnings: PlanWarning[];
+  prepared: Record<string, number | boolean>;
+  versions: PlanVersion[];
+  /** Which actions each kind of column may take. Sent with the plan so the dropdowns
+   *  cannot offer something the backend would refuse. */
+  actions_for_kind: Record<string, PlanAction[]>;
+};
+
+export type DriftFeature = {
+  column: string;
+  statistic: number;
+  p_value: number;
+  severity: string;
+  message: string;
+  suggestion: string;
+};
+
+export type RunChecks = {
+  drift?: {
+    flagged: number;
+    tested: number;
+    skipped: number;
+    threshold: number;
+    features: DriftFeature[];
+    note: string;
+  };
+  balance?: {
+    classes: {
+      value: string;
+      train_count: number;
+      test_count: number;
+      train_share: number;
+      test_share: number;
+      delta: number;
+    }[];
+    warnings: PlanWarning[];
+  } | null;
+  baseline?: {
+    task: string;
+    metric: string;
+    folds: number;
+    baseline: number;
+    model: string;
+    model_score: number;
+    lift: number;
+    severity: string;
+    verdict: string;
+    note: string;
+  } | null;
+};
+
+export type Run = {
+  id: string;
+  status: "running" | "succeeded" | "failed";
+  dataset_id: string;
+  plan_id: string;
+  plan_version: number;
+  created_at: string;
+  completed_at: string | null;
+  duration_ms: number;
+  target: string;
+  task: string;
+  split: {
+    test_size: number;
+    seed: number;
+    stratified: boolean;
+    train_rows: number;
+    test_rows: number;
+  };
+  n_features: number;
+  output_hash: string | null;
+  artifacts: string[];
+  error: { type: string; message: string } | null;
+  warnings: PlanWarning[];
+  checks: RunChecks;
+  feature_schema: Record<string, unknown>;
+};
+
+
+export type Histogram =
+  | { kind: "numeric"; bins: number; edges: number[]; counts: number[] }
+  | { kind: "categorical"; labels: string[]; counts: number[]; other: number };
+
+export type ColumnProfile = {
+  column: string;
+  kind: string;
+  kind_label: string;
+  dtype: string;
+  n_missing: number;
+  missing_rate: number;
+  n_unique: number;
+  unique_rate: number;
+  n_rows: number;
+  outliers: { count: number; share: number; lower: number; upper: number } | null;
+  stats: Record<string, number | boolean> | null;
+  /** Bin counts computed server-side — the browser holds one page of rows and would
+   *  draw a different distribution on every page. */
+  histogram: Histogram | null;
+  top_values: { value: string; count: number; share: number }[];
+  flags: string[];
+  is_target: boolean;
+  used: boolean;
+  excluded_reason: string | null;
+};
+
+export type DatasetProfile = {
+  dataset_id: string;
+  n_rows: number;
+  n_columns: number;
+  duplicate_rows: number;
+  columns: ColumnProfile[];
+};
 
 async function request<T>(path: string, init?: RequestInit): Promise<T> {
   let response: Response;
@@ -389,6 +596,45 @@ export const api = {
   },
 
   listDatasets: () => request<DatasetSummary[]>("/api/datasets"),
+
+  // --- the plan and the run ---------------------------------------------------------
+
+  proposePlan: (datasetId: string, goal: string, target?: string) =>
+    request<Plan>(`/api/datasets/${datasetId}/plan`, json({ goal, target: target ?? null })),
+
+  readPlan: (datasetId: string, version?: number) =>
+    request<Plan>(
+      `/api/datasets/${datasetId}/plan${version ? `?version=${version}` : ""}`,
+    ),
+
+  /** Applies the user's changes as a NEW version; the plan named here is unchanged. */
+  editPlan: (
+    planId: string,
+    columns: Record<string, { action: PlanAction }>,
+    options?: Partial<PlanOptions>,
+  ) => request<Plan>(`/api/plans/${planId}`, put({ columns, options: options ?? null })),
+
+  runPlan: (planId: string) =>
+    request<Run>(`/api/plans/${planId}/run`, { method: "POST" }),
+
+  listRuns: (datasetId: string) =>
+    request<{ dataset_id: string; runs: Run[] }>(`/api/datasets/${datasetId}/runs`),
+
+  readRun: (runId: string) => request<Run>(`/api/runs/${runId}`),
+
+  readProfile: (datasetId: string) =>
+    request<DatasetProfile>(`/api/datasets/${datasetId}/profile`),
+
+  artifactUrl: (runId: string, name: string) => `/api/runs/${runId}/artifacts/${name}`,
+
+  deleteDataset: (datasetId: string) =>
+    request<{
+      deleted: boolean;
+      filename: string;
+      artifacts_removed: number;
+      artifacts_orphaned: string[];
+    }>(`/api/datasets/${datasetId}`, { method: "DELETE" }),
+
 
   openWorkspace: (datasetId: string) =>
     request<Workspace>(`/api/workspaces/from-dataset/${datasetId}`, { method: "POST" }),

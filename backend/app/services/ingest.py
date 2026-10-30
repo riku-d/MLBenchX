@@ -218,6 +218,9 @@ class IngestResult:
     datetime_columns: list[str] = field(default_factory=list)
     #: Columns recognised as true/false answers.
     boolean_columns: list[str] = field(default_factory=list)
+    #: Columns written as percentages. Kept in percentage points — see
+    #: :func:`_percentage_columns` for why, and why that is stated rather than assumed.
+    percentage_columns: list[str] = field(default_factory=list)
     #: ``{original heading: cleaned heading}``. Every message names a column, and a user
     #: who uploaded " Total Revenue " needs to see the name they typed.
     column_mapping: dict[str, str | list[str]] = field(default_factory=dict)
@@ -274,6 +277,77 @@ def _blank_placeholders(df: pd.DataFrame) -> int:
         as_text = series.astype("string")
         normalised = as_text.str.strip().str.lower()
         hits = normalised.isin(MISSING_TOKENS) & series.notna()
+        count = int(hits.sum())
+        if count:
+            df.loc[hits, column] = np.nan
+            replaced += count
+    return replaced
+
+
+def _percentage_columns(df: pd.DataFrame) -> list[str]:
+    """Columns written as percentages — every non-blank value ending in ``%``.
+
+    Detected before :func:`_coerce_numeric` strips the sign, because afterwards there is
+    nothing left to detect: ``12%`` and ``12`` are the same float.
+
+    **The representation is percentage points, not a decimal fraction.** ``12%`` becomes
+    ``12``, not ``0.12``. Three things decided that, and they are worth recording because
+    the opposite choice is equally defensible in the abstract:
+
+    1. Every scaler this application offers — standard, min-max and robust — is an
+       affine transform, so dividing a column by 100 cancels exactly. The two
+       representations produce *identical* model inputs. The choice cannot make a model
+       better or worse.
+    2. It is therefore only about what the user reads. "Mean conversion rate: 17" is
+       what someone who wrote ``17%`` in their spreadsheet expects to see; 0.17 is a
+       unit they did not use.
+    3. Changing it now would silently multiply every such column in every existing
+       dataset by 100, to no modelling benefit. A change with a cost and no gain is not
+       an improvement.
+
+    What *was* wrong is that none of this was said. The sign was stripped inside a
+    sentence about converting text to numbers, so a user whose column lost its unit had
+    no way to know. The columns are returned here so the repair can be reported on its
+    own terms.
+    """
+    found: list[str] = []
+    for column in df.columns:
+        series = df[column]
+        if series.dtype != object:
+            continue
+        values = series.dropna()
+        if values.empty:
+            continue
+        text = values.astype("string").str.strip()
+        if text.str.endswith("%").all():
+            found.append(str(column))
+    return found
+
+
+def _blank_non_finite(df: pd.DataFrame) -> int:
+    """Turn ``inf`` and ``-inf`` into real blanks. Returns how many were found.
+
+    Infinity is not a measurement. It reaches a spreadsheet as an overflow, a division
+    by zero or the literal text ``inf``, and nothing downstream has a definition for
+    it: ``numpy.histogram`` refuses a non-finite range outright, a mean computed with
+    one in the column is itself infinite, ``json.dumps`` emits a bare ``Infinity`` that
+    no strict JSON parser will read back, and every scikit-learn estimator rejects it
+    before it fits.
+
+    Treating it as missing is the only reading that is true to the data: the real value
+    is unknown, which is exactly what a blank says. The imputer then fills it from the
+    training rows like any other gap, and the repair is reported as a sentence so the
+    change is never silent.
+
+    Runs after :func:`_coerce_numeric` so that a column of text where one entry reads
+    ``inf`` is covered too — it is a float column by then.
+    """
+    replaced = 0
+    for column in df.columns:
+        series = df[column]
+        if not pd.api.types.is_numeric_dtype(series) or pd.api.types.is_bool_dtype(series):
+            continue
+        hits = np.isinf(series.to_numpy(dtype="float64", na_value=np.nan))
         count = int(hits.sum())
         if count:
             df.loc[hits, column] = np.nan
@@ -843,12 +917,26 @@ def read_upload(
             "genuinely missing"
         )
 
+    percentages = _percentage_columns(frame)
     converted = _coerce_numeric(frame)
+    if percentages:
+        shown = ", ".join(percentages[:4]) + (" and others" if len(percentages) > 4 else "")
+        cleaning.append(
+            f"Read {_plural(len(percentages), 'column')} written as percentages in "
+            f"percentage points, so 12% is 12 rather than 0.12: {shown}"
+        )
     if converted:
         shown = ", ".join(converted[:4]) + (" and others" if len(converted) > 4 else "")
         cleaning.append(
             f"Converted {_plural(len(converted), 'column')} stored as text into "
             f"numbers: {shown}"
+        )
+
+    non_finite = _blank_non_finite(frame)
+    if non_finite:
+        cleaning.append(
+            f"Treated {_plural(non_finite, 'infinite value')} as missing — infinity is "
+            "an overflow rather than a measurement, so the real value is unknown"
         )
 
     unparsed_dates: dict[str, int] = {}
@@ -903,6 +991,7 @@ def read_upload(
         numeric_columns=converted,
         datetime_columns=dates,
         boolean_columns=booleans,
+        percentage_columns=percentages,
         column_mapping=column_mapping,
         sheet_name=sheet_name,
         available_sheets=(
@@ -966,6 +1055,16 @@ def load_frame() -> pd.DataFrame:
                 df[column].astype("string").str.strip().str.replace(NUMERIC_NOISE, "", regex=True)
             )
             df[column] = pd.to_numeric(cleaned, errors="coerce")
+
+    # Infinity is an overflow, not a measurement, so it is read as a blank and the
+    # imputer fills it from the training rows like any other gap.
+    for column in df.columns:
+        if pd.api.types.is_numeric_dtype(df[column]) and not pd.api.types.is_bool_dtype(
+            df[column]
+        ):
+            df.loc[np.isinf(df[column].to_numpy(dtype="float64", na_value=np.nan)), column] = (
+                np.nan
+            )
 
     # Columns stored as text that are really dates.
     for column in TEXT_DATE_COLUMNS:

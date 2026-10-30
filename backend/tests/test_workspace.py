@@ -76,6 +76,89 @@ def test_a_dataset_has_exactly_one_workspace(client, workspace) -> None:
     assert again.json()["id"] == workspace["id"]
 
 
+def _upload(client, name: str = "titanic.csv") -> str:
+    with FIXTURE.open("rb") as handle:
+        return client.post("/api/datasets", files={"file": (name, handle, "text/csv")}).json()["id"]
+
+
+def _workspace_rows(dataset_id: str) -> int:
+    from sqlalchemy import func, select
+
+    from app.db import SessionLocal, Workspace
+
+    with SessionLocal() as session:
+        return session.scalar(
+            select(func.count()).select_from(Workspace).where(Workspace.dataset_id == dataset_id)
+        )
+
+
+def test_opening_again_returns_the_existing_workspace_with_200(client, workspace) -> None:
+    """201 means a workspace was made; reopening one that exists is a plain read."""
+    dataset_id = workspace["dataset"]["id"]
+    again = client.post(f"/api/workspaces/from-dataset/{dataset_id}")
+
+    assert again.status_code == 200, again.text
+    assert again.json()["id"] == workspace["id"]
+    assert _workspace_rows(dataset_id) == 1
+    history = client.get(f"/api/workspaces/{workspace['id']}/history").json()
+    entries = history["entries"] if isinstance(history, dict) else history
+    assert [e["kind"] for e in entries].count("created") == 1
+
+
+def test_concurrent_opens_of_one_dataset_make_one_workspace(client, monkeypatch) -> None:
+    """React StrictMode mounts the workspace twice in development, so two POSTs arrive
+    together. Both must get the same workspace; neither may see the unique constraint.
+
+    The barrier holds both requests after their existence check and before their insert
+    — the window in which the race happens — so the test is deterministic, not lucky.
+    """
+    import threading
+
+    from app import workspace as workspace_module
+
+    dataset_id = _upload(client)
+    both_checked = threading.Barrier(2, timeout=30)
+    original = workspace_module._guess_target
+
+    def guess_after_both_checked(frame):
+        both_checked.wait()
+        return original(frame)
+
+    monkeypatch.setattr(workspace_module, "_guess_target", guess_after_both_checked)
+
+    responses: list = [None, None]
+
+    def open_workspace(slot: int) -> None:
+        with TestClient(app) as own_client:
+            responses[slot] = own_client.post(f"/api/workspaces/from-dataset/{dataset_id}")
+
+    threads = [threading.Thread(target=open_workspace, args=(i,)) for i in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=60)
+
+    assert all(r is not None for r in responses), "a request did not finish"
+    assert sorted(r.status_code for r in responses) == [200, 201], [r.text for r in responses]
+    assert responses[0].json()["id"] == responses[1].json()["id"]
+    assert _workspace_rows(dataset_id) == 1
+
+
+def test_each_dataset_gets_its_own_workspace(client) -> None:
+    datasets = [_upload(client, f"titanic_{n}.csv") for n in "abc"]
+    opened = [client.post(f"/api/workspaces/from-dataset/{d}") for d in datasets]
+
+    assert [r.status_code for r in opened] == [201, 201, 201]
+    assert len({r.json()["id"] for r in opened}) == 3
+    assert [r.json()["dataset"]["id"] for r in opened] == datasets
+    assert all(_workspace_rows(d) == 1 for d in datasets)
+
+
+def test_opening_a_workspace_for_an_unknown_dataset_is_a_404(client) -> None:
+    response = client.post("/api/workspaces/from-dataset/does-not-exist")
+    assert response.status_code == 404
+
+
 def test_every_step_reports_what_it_is_doing_to_this_dataset(workspace) -> None:
     steps = {step["id"]: step for step in workspace["steps"]}
 

@@ -369,3 +369,84 @@ def test_health_reports_what_is_stored(client, dataset_id) -> None:
     body = client.get("/api/health").json()
     assert body["ok"] is True
     assert body["datasets"] >= 1
+
+
+# --------------------------------------------------------------------------------------
+# CORS, checked against the routes rather than against a list someone maintains
+#
+# The interface runs on a different origin from the API in development, so the browser
+# asks permission before it sends anything but a simple request. `PUT` was missing from
+# `allow_methods` while two workspace routes used it, which made saving the pipeline
+# configuration and saving edited code fail in the real application and nowhere else:
+# `TestClient` calls the app directly and never performs a preflight.
+#
+# Asserting the policy against the router closes that gap for the next method added.
+# --------------------------------------------------------------------------------------
+
+DEV_ORIGIN = "http://localhost:5173"
+
+
+def _routed_methods() -> set[str]:
+    """Every HTTP method some `/api` route answers to, preflight verbs excluded.
+
+    Read from the OpenAPI document rather than by walking ``app.routes``. A router
+    brought in with ``include_router`` appears there as one opaque ``_IncludedRouter``
+    entry whose paths are not reachable by iteration, so walking the list silently
+    misses every workspace route — which is exactly the half of the API that uses PUT,
+    and exactly how this went unnoticed. The OpenAPI document is generated from the
+    real routing table and lists them all.
+    """
+    paths = app.openapi()["paths"]
+    return {
+        method.upper()
+        for path, operations in paths.items()
+        if path.startswith("/api")
+        for method in operations
+        if method.upper() not in ("HEAD", "OPTIONS")
+    }
+
+
+@pytest.mark.parametrize("method", sorted(_routed_methods()))
+def test_every_method_the_api_uses_survives_a_preflight(client, method) -> None:
+    response = client.options(
+        "/api/datasets",
+        headers={
+            "Origin": DEV_ORIGIN,
+            "Access-Control-Request-Method": method,
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200, (
+        f"a browser cannot send {method} to this API: {response.text}"
+    )
+    allowed = response.headers["access-control-allow-methods"]
+    assert method in allowed, f"{method} missing from {allowed}"
+
+
+def test_saving_a_workspace_configuration_is_reachable_from_the_browser(client) -> None:
+    """The specific interaction the missing method broke."""
+    response = client.options(
+        "/api/workspaces/any-id/config",
+        headers={
+            "Origin": DEV_ORIGIN,
+            "Access-Control-Request-Method": "PUT",
+            "Access-Control-Request-Headers": "content-type",
+        },
+    )
+
+    assert response.status_code == 200, response.text
+    assert "PUT" in response.headers["access-control-allow-methods"]
+
+
+def test_an_origin_the_app_does_not_serve_is_still_refused(client) -> None:
+    """Widening the methods must not have widened the origins."""
+    response = client.options(
+        "/api/datasets",
+        headers={
+            "Origin": "http://evil.example.com",
+            "Access-Control-Request-Method": "GET",
+        },
+    )
+
+    assert "access-control-allow-origin" not in response.headers

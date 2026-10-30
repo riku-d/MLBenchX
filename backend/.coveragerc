@@ -4,6 +4,11 @@
 # written to a file and executed inside the sandbox — so coverage cannot see it, and
 # counting it would report 0% for code that `test_codegen.py` exercises thoroughly by
 # running it.
+#
+# `app/plan.py` and `app/runner.py` were omitted here while they were an unwired
+# island. They are no longer: `app/services/planning.py` and `app/planning_api.py`
+# reach both, and they are the implementation of the plan and run resources. The
+# omissions are gone and both are measured like everything else.
 
 [run]
 source = app

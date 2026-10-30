@@ -220,9 +220,15 @@ function CompileResult({
 export function Workspace({
   datasetId,
   onExit,
+  onReviewPlan,
+  onDeleted,
 }: {
   datasetId: string;
   onExit: () => void;
+  /** Open the propose -> review -> execute screen for this dataset. */
+  onReviewPlan: () => void;
+  /** Called once the dataset and everything derived from it has been removed. */
+  onDeleted: () => void;
 }) {
   const [workspace, setWorkspace] = useState<WorkspaceState | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -234,6 +240,9 @@ export function Workspace({
   const [mobileTab, setMobileTab] = useState<"pipeline" | "code" | "insights" | "data">("pipeline");
   const [dockHeight, setDockHeight] = useState(240);
   const [sandboxOpen, setSandboxOpen] = useState(false);
+  const [confirmDelete, setConfirmDelete] = useState(false);
+  const [deleting, setDeleting] = useState(false);
+  const [deleteError, setDeleteError] = useState<string | null>(null);
 
   const [pendingToggle, setPendingToggle] = useState<{ step: StepId; enabled: boolean } | null>(null);
   const [impact, setImpact] = useState<ImpactReport | null>(null);
@@ -241,12 +250,21 @@ export function Workspace({
 
   // ------------------------------------------------------------------- loading
   useEffect(() => {
+    // Ignore the answer once this effect is superseded — by StrictMode's second mount in
+    // development, or by switching dataset — so a stale reply cannot overwrite the current one.
+    let current = true;
     api
       .openWorkspace(datasetId)
-      .then(setWorkspace)
-      .catch((caught) =>
-        setLoadError(caught instanceof ApiError ? caught.message : "Could not open the workspace."),
-      );
+      .then((opened) => {
+        if (current) setWorkspace(opened);
+      })
+      .catch((caught) => {
+        if (current)
+          setLoadError(caught instanceof ApiError ? caught.message : "Could not open the workspace.");
+      });
+    return () => {
+      current = false;
+    };
   }, [datasetId]);
 
   useEffect(() => {
@@ -432,6 +450,19 @@ export function Workspace({
           </span>
         </div>
 
+        <Button size="sm" variant="ghost" onClick={onReviewPlan} className="shrink-0">
+          Review the plan
+        </Button>
+
+        <Button
+          size="sm"
+          variant="ghost"
+          onClick={() => setConfirmDelete(true)}
+          className="shrink-0 text-muted hover:text-danger"
+        >
+          Delete dataset
+        </Button>
+
         {workspace.has_uncompiled_changes && (
           <Badge tone="warn" className="shrink-0">
             <span className="h-1 w-1 rounded-full bg-warn" /> uncompiled changes
@@ -590,6 +621,68 @@ export function Workspace({
       </div>
 
       {banner && <CompileResult compilation={banner} onDismiss={() => setBanner(null)} />}
+
+      <Dialog
+        open={confirmDelete}
+        title="Delete this dataset?"
+        tone="danger"
+        onClose={() => {
+          setConfirmDelete(false);
+          setDeleteError(null);
+        }}
+        footer={
+          <>
+            <Button
+              variant="ghost"
+              disabled={deleting}
+              onClick={() => {
+                setConfirmDelete(false);
+                setDeleteError(null);
+              }}
+            >
+              Keep it
+            </Button>
+            <Button
+              variant="danger"
+              disabled={deleting}
+              onClick={async () => {
+                setDeleting(true);
+                setDeleteError(null);
+                try {
+                  await api.deleteDataset(datasetId);
+                  onDeleted();
+                } catch (exc) {
+                  setDeleteError(
+                    exc instanceof Error
+                      ? exc.message
+                      : "The dataset could not be deleted.",
+                  );
+                } finally {
+                  setDeleting(false);
+                }
+              }}
+            >
+              {deleting ? <Spinner /> : null}
+              Delete permanently
+            </Button>
+          </>
+        }
+      >
+        <p className="text-[13px] text-text">
+          This removes <span className="font-mono">{workspace?.dataset.filename}</span>{" "}
+          and everything made from it — the profile, this workspace and its history,
+          every plan and every run, and the stored copy of the file.
+        </p>
+        <p className="mt-2 text-[12px] text-muted">
+          It cannot be undone, and nothing is kept to restore from. Other datasets are
+          not affected.
+        </p>
+        {deleteError ? (
+          <p className="mt-3 rounded border border-danger/40 bg-danger/5 px-2 py-1 text-[12px] text-danger">
+            {deleteError}
+          </p>
+        ) : null}
+      </Dialog>
 
       <Dialog
         open={sandboxOpen}

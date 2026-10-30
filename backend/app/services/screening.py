@@ -52,6 +52,7 @@ from app.config import (
     IDENTIFIER_UNIQUE_RATE,
     LEAKAGE_CORRELATION,
     LEAKAGE_TREE_CV_FOLDS,
+    LEAKAGE_TREE_DEPTH,
     LEAKAGE_TREE_SCORE,
     MIN_ROWS_FOR_CORRELATION,
     NAMED_IDENTIFIER_UNIQUE_RATE,
@@ -185,11 +186,11 @@ def _probe_score(feature: pd.Series, y: pd.Series) -> float | None:
         folds = min(LEAKAGE_TREE_CV_FOLDS, int(labels.value_counts().min()))
         if folds < 2:
             return None
-        model = DecisionTreeClassifier(max_depth=2, random_state=SEED)
+        model = DecisionTreeClassifier(max_depth=LEAKAGE_TREE_DEPTH, random_state=SEED)
         scoring = "accuracy"
     else:
         folds = LEAKAGE_TREE_CV_FOLDS
-        model = DecisionTreeRegressor(max_depth=2, random_state=SEED)
+        model = DecisionTreeRegressor(max_depth=LEAKAGE_TREE_DEPTH, random_state=SEED)
         scoring = "r2"
 
     try:

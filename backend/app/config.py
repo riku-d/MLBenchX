@@ -47,6 +47,8 @@ __all__ = [
     "MIN_ROWS_FOR_BASELINE",
     "MIN_ROWS_FOR_DRIFT",
     "OUTLIER_IQR_MULTIPLIER",
+    "MISSING_INDICATOR_RATE",
+    "RARE_CATEGORY_RATE",
     "HISTOGRAM_BINS",
     "TOP_VALUES",
     "SKEW_THRESHOLD",
@@ -205,6 +207,16 @@ MIN_ROWS_FOR_CORRELATION = _int("MIN_ROWS_FOR_CORRELATION", 30)
 #: quartiles is reported as an outlier. 1.5 is the convention behind every box plot;
 #: it is reported, never acted on.
 OUTLIER_IQR_MULTIPLIER = _float("OUTLIER_IQR_MULTIPLIER", 1.5)
+
+#: A column missing more than this share gets a companion yes/no column recording which
+#: rows were blank. Below it the indicator is mostly zeros and costs more width than it
+#: carries; above it, whether a value was missing is often predictive in itself.
+MISSING_INDICATOR_RATE = _float("MISSING_INDICATOR_RATE", 0.05)
+
+#: Categories occurring in less than this share of rows are grouped as "Other". A value
+#: seen four times in ten thousand rows teaches the model nothing that generalises, and
+#: one that appears only in the held-out fold would be unseen at prediction time.
+RARE_CATEGORY_RATE = _float("RARE_CATEGORY_RATE", 0.01)
 
 #: Bins in a numeric column's histogram. Twenty is enough to show shape — bimodality,
 #: a spike at zero, a long tail — without turning a few hundred rows into noise.
