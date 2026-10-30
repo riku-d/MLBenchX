@@ -257,10 +257,10 @@ def _envelope(
 ) -> JSONResponse:
     """The one error shape every route answers with.
 
-    ``docs/PHASE1_SPEC.md`` §7 asks for ``{code, message, detail}``; every existing
-    client — and every existing test — reads ``error``. Both are served, which costs one
-    duplicated string and breaks nothing: ``error`` stays exactly what it has always
-    been, and the three specified fields are added beside it.
+    The product's requirements (``docs/PRD.md`` §7.3.1) ask for ``{code, message,
+    detail}``; every existing client — and every existing test — reads ``error``. Both
+    are served, which costs one duplicated string and breaks nothing: ``error`` stays
+    exactly what it has always been, and the three specified fields are added beside it.
 
     That is the whole migration. There is no second URL, no version header and no date
     on which ``error`` stops being sent; a field nobody reads is cheaper than a flag day.

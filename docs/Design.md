@@ -280,9 +280,10 @@ anything else                ─────▶ 500 — a defect, not a user err
 Two deliberate properties. **Nothing is swallowed**: a condition that is not the user's
 fault reaches the 500 handler rather than being absorbed into an empty result — a silent
 degradation is the failure mode this product exists to argue against. And `{"error": …}`
-is **not** the `{code, message, detail}` envelope `docs/PHASE1_SPEC.md` §7 specifies;
-changing it breaks every existing client, so it is recorded as divergence rather than
-fixed. AUDIT.md §5.7 O6.
+is no longer the whole story: the Phase 1 specification asked for a
+`{code, message, detail}` envelope, and both are now sent — `error` unchanged for
+existing clients, the three specified fields beside it. See [AUDIT.md](AUDIT.md) §8.2 O6
+and [PRD.md](PRD.md) §7.3.1.
 
 ### 5.3 Schema strictness, and where it stops
 

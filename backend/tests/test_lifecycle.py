@@ -1,6 +1,6 @@
 """Two cross-cutting contracts: how an error is shaped, and how a dataset goes away.
 
-**The error envelope.** `docs/PHASE1_SPEC.md` §7 asks for `{code, message, detail}`;
+**The error envelope.** `docs/PRD.md` §7.3.1 asks for `{code, message, detail}`;
 every client and test written so far reads `error`. Both are sent. The tests below pin
 that additively — the old field keeps its exact meaning, the three new ones are present
 on every failure path, and a malformed request no longer answers in a different shape

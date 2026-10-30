@@ -14,8 +14,11 @@ what the gap is.
 | [Design.md](Design.md) | How it is built, and why it is built that way |
 | [AUDIT.md](AUDIT.md) | What is actually true today — verification evidence, defects, remediation |
 
-The Phase 1 specification this release was built against is
-[docs/PHASE1_SPEC.md](docs/PHASE1_SPEC.md).
+**This document is the requirements authority.** It was written against an earlier
+Phase 1 specification (`docs/PHASE1_SPEC.md`), which has since been removed from the
+repository; every requirement that specification carried has been restated here in §3
+and §4, with its status and verification. Where the text below refers to "the Phase 1
+specification", it is naming that retired source, not a file you can open.
 
 Requirement identifiers defined here (`FR-ING-001`, `NFR-004`) are referenced from both
 other documents. Technical reasoning is not repeated here — it is in Design.md.
@@ -441,9 +444,9 @@ reassembles state from a patch.
 ```
 
 Emitted with `400` for everything the user can fix. `404` uses FastAPI's `{"detail": …}`.
-**This is not the uniform `{code, message, detail}` envelope `docs/PHASE1_SPEC.md` §7
-asks for** — recorded as a gap in AUDIT.md rather than changed, because changing it
-breaks every existing client.
+The Phase 1 specification asked for a uniform `{code, message, detail}` envelope. Both
+are now sent: `error` keeps its original meaning for existing clients, and the three
+specified fields are added beside it (§7.3.1). See [AUDIT.md](AUDIT.md) §8.2 O6.
 
 ### 7.3.1 CORS
 

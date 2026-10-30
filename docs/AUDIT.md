@@ -14,10 +14,15 @@ them.
 | [AUDIT.md](AUDIT.md) | What is actually true today — verification evidence, defects, remediation |
 
 This document records *status and evidence*. The requirements it judges against are
-PRD.md §3–4 and [docs/PHASE1_SPEC.md](docs/PHASE1_SPEC.md); the reasoning behind the
-designs it judges is Design.md, and is referenced rather than restated. The previous
-audit against a narrower spec is archived in
-[docs/AUDIT_PREVIOUS.md](docs/AUDIT_PREVIOUS.md).
+[PRD.md](PRD.md) §3–4; the reasoning behind the designs it judges is
+[Design.md](Design.md), and is referenced rather than restated.
+
+Two sources this audit was originally written against have since been removed from the
+repository: the Phase 1 specification (`docs/PHASE1_SPEC.md`) and the archive of an
+earlier, narrower audit (`docs/AUDIT_PREVIOUS.md`). Their substance survives — the
+specification's requirements are restated in PRD.md §3–4, and the earlier audit's
+findings were carried into §7 below. References to "the Phase 1 specification" name that
+retired source, not a file in this repository.
 
 This is a living document, not a changelog. The prior revision of it audited an earlier
 tree; its §4 coverage table has been superseded because most of its ❌ rows were closed
@@ -353,9 +358,9 @@ routing table.
 | O3 | `app/plan.py` / `app/runner.py` unreachable, and the only home of two spec features | A reader of `config.py` believes missing-indicator and rare-category grouping exist | Wire in or delete, then remove the two `omit` lines from `.coveragerc` |
 | O4 | `recharts` and `framer-motion` installed, imported by zero files | Dependency surface with no user | Use one for the histogram the backend already computes, or drop both |
 | O5 | Two health-scoring systems | They can disagree about the same file | Unify on `health.assess`; keep `_score_quality` only if ingestion genuinely needs a score before profiling |
-| O6 | Error envelope is `{"error": …}`, not the spec's `{code, message, detail}` | Divergence from `docs/PHASE1_SPEC.md` §7 | Deliberately not changed — it breaks every existing client. Decide at the next API version |
+| O6 | Error envelope is `{"error": …}`, not the spec's `{code, message, detail}` | Divergence from the Phase 1 specification §7 | Deliberately not changed — it breaks every existing client. Decide at the next API version |
 | O7 | `12%` ingests as `12` | A percentage column is scaled 100× | Decide the semantics, then change it loudly. Not a silent fix |
-| O8 | `plan.md` and `docs/PHASE1_SPEC.md` both link to `VERIFICATION.md`, which does not exist | Two broken documentation links | Point them at PRD.md §8 and this §5, or write the file |
+| O8 | `plan.md` and the Phase 1 specification both link to `VERIFICATION.md`, which does not exist | Two broken documentation links | Point them at PRD.md §8 and this §5, or write the file |
 | O9 | No `DELETE /api/datasets/{id}` | Uploads accumulate with no API to remove them | Add the route and widen CORS to match |
 
 ---
@@ -368,9 +373,15 @@ routing table.
   inside it and each tool that wrote it found **no reference from any source file,
   test, configuration, CI definition or documentation link**. Nothing depended on it, so
   nothing needed repairing and no replacement was created. Deleted outright.
-* No other file was removed. `Sem;colon (2).pptx`, `plan.md`, `docs/DECK_FACTS.md` and
-  `docs/DEMO_GUIDE.md` are untracked user work and were left alone, as were the
-  uncommitted deletions of `CLAUDE.md` and `.claude/` already present in the tree.
+* No other file was removed **in that round**. `Sem;colon (2).pptx`, `plan.md`,
+  `docs/DECK_FACTS.md` and `docs/DEMO_GUIDE.md` were user work and were left alone, as
+  were the uncommitted deletions of `CLAUDE.md` and `.claude/` already in the tree.
+* **Later, at the user's request**, `docs/` was reorganised: the Phase 1 specification,
+  the previous audit archive, and the two Sem-7 deck documents (`DECK_FACTS.md`,
+  `DEMO_GUIDE.md`) were removed, and this document, PRD.md, Design.md and plan.md were
+  moved into `docs/`. The deck documents described the repository at commit `5a2328e`
+  and were already stale. Nothing in the application reads any of them; the removal
+  cost is the loss of the specification's own wording, which §3–4 of PRD.md restates.
 
 ---
 
@@ -432,7 +443,7 @@ applying from empty. Nothing had drifted.
 | **O5** | Two health-scoring systems | **FIXED AND VERIFIED** | `health.assess` confirmed canonical — it is already what `Dataset.health_score`, `Profile.health_score` and the workspace report. The ingest-time check is retained (it runs before any profile exists) and is labelled on the wire as *"Ingest quality check (not the workspace health score)"*. Five tests in `test_lifecycle.py` pin this, including one asserting the two scores **differ** on the fixture, so a test that conflated them could not pass |
 | **O6** | `{"error"}` vs the spec's `{code, message, detail}` | **FIXED AND VERIFIED** | Both are sent. `error` is unchanged for every existing client; `code`, `message` and `detail` are added beside it. A stable code vocabulary distinguishes the three categories the spec asks for. Two real inconsistencies fixed on the way: `RequestValidationError` answered in a different shape entirely (`{"detail": [...]}`), and a URL matching no route bypassed the handler because Starlette's router raises the **base** `HTTPException`, not FastAPI's subclass |
 | **O7** | `12%` → `12`, not `0.12` | **FIXED AND VERIFIED — semantics deliberately unchanged** | The spec names `"12%"` as a string to coerce but not to what. Measured the thing that settles it: **all three scalers are affine, so the two representations produce identical model inputs** (test included). The choice therefore affects only what the user reads, and rescaling every existing dataset by 100 would be a cost with no benefit. Percentage points kept; what was wrong — that the unit was dropped *silently* — is fixed: such columns are detected and reported as their own repair. Seven tests cover `12%`, `0.12`, `12`, blanks, and a mixed column (which is **not** claimed as a percentage) |
-| **O8** | Links to a non-existent `VERIFICATION.md` | **FIXED AND VERIFIED** | `plan.md` and `docs/PHASE1_SPEC.md` repointed at AUDIT.md §5 and PRD.md §8. No placeholder file created. Every relative link in every markdown file now resolves, checked programmatically |
+| **O8** | Links to a non-existent `VERIFICATION.md` | **FIXED AND VERIFIED** | `plan.md` and the Phase 1 specification repointed at AUDIT.md §5 and PRD.md §8. No placeholder file created. Every relative link in every markdown file now resolves, checked programmatically |
 | **O9** | No `DELETE /api/datasets/{id}` | **FIXED AND VERIFIED** | Route added, plus the UI with a danger-toned confirmation naming exactly what goes. **Ordering is the design decision**: rows are deleted and committed first, files second, so a partial failure strands bytes (recoverable) rather than leaving rows pointing at data that is gone (not). Orphaned keys are reported, not hidden. A latent defect was fixed to make this work at all — see §8.4 |
 
 ### 8.3 The three structural gaps

@@ -3,8 +3,8 @@
 Transparent AutoML for tabular data. Upload → profile → review and override the
 preprocessing plan → execute → see every transformation explained → download artifacts.
 
-Phase 1 source of truth: [docs/PHASE1_SPEC.md](docs/PHASE1_SPEC.md). Requirements and
-acceptance criteria: [PRD.md](PRD.md). Technical design: [Design.md](Design.md).
+Requirements and acceptance criteria: [PRD.md](PRD.md). Technical design:
+[Design.md](Design.md). Status, evidence and defects: [AUDIT.md](AUDIT.md).
 
 Verification evidence — commands run, actual results, coverage, and known limitations —
 is in [AUDIT.md](AUDIT.md) §5, with the test and acceptance plan it satisfies in
@@ -44,6 +44,6 @@ cd frontend && npm run dev
 - Type hints on all Python.
 - Dependency versions pinned.
 - The train/test split happens before anything is measured or decided — not only before
-  fitting. See `docs/PHASE1_SPEC.md` §4 and `backend/tests/test_leakage.py`.
+  fitting. See [Design.md](Design.md) §7 and `backend/tests/test_leakage.py`.
 - No stubs, TODOs or mocked results. If something cannot be done, it is stated rather
   than faked.

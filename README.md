@@ -8,6 +8,15 @@ Other AutoML tools transform your data silently. This is the counter-argument: e
 automated recommendation is **visible, explained, optional and reversible**, and the
 code that runs is code you can read and change.
 
+### The documentation
+
+| | |
+|---|---|
+| [docs/PRD.md](docs/PRD.md) | What the product must do, and what counts as done |
+| [docs/Design.md](docs/Design.md) | How it is built, and why it is built that way |
+| [docs/AUDIT.md](docs/AUDIT.md) | What is actually true today — evidence, defects, remediation |
+| [docs/plan.md](docs/plan.md) | Layout and conventions, in brief |
+
 ---
 
 ## Running it
