@@ -1,4 +1,4 @@
-# ML-BenchX — glass-box preprocessing
+# ML-BenchX: glass-box preprocessing
 
 Upload a spreadsheet, see exactly what is wrong with it, switch any preprocessing step
 on or off with the consequences spelled out first, edit the generated Python by hand,
